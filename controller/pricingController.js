@@ -69,10 +69,16 @@ const getPricingQuote = async (req, res) => {
       return res.status(404).json({ success: false, message: "Dealer not found" });
     }
 
+    // Prefer AdminService ids, but also accept BaseService ids from older app
+    // builds/dealer-service responses. Always scope the resolution to this
+    // dealer so a catalog id can never select another garage's pricing row.
     const services = await AdminService.find({
-      _id: { $in: serviceIds },
       dealer_id: dealerId,
       isActive: true,
+      $or: [
+        { _id: { $in: serviceIds } },
+        { base_service_id: { $in: serviceIds } },
+      ],
     })
       .select("bikes base_service_id")
       .populate("base_service_id", "mrBikeMoneyMaxRedeem")
