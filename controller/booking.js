@@ -52,6 +52,10 @@ const {
   PICKUP_STATUSES,
 } = require("../services/pickupLifecycle");
 const { verifyPickupOtp } = require("./pickupLifecycleController");
+const {
+  resolveCancellationReason,
+  canCustomerCancel,
+} = require("../utils/bookingCancellation");
 
 async function checkPermission(user_id, requiredPermission) {
   try {
@@ -2635,41 +2639,80 @@ async function getallbookings(req, res) {
   }
 }
 
-// Cancel Booking - User can cancel pending bookings
+// Cancel Booking - authenticated customers can cancel their own pending request.
+// The status predicate is repeated in the atomic update to prevent an accept /
+// cancel race from cancelling a booking after a dealer has confirmed it.
 async function cancelBooking(req, res) {
   try {
     const { bookingId } = req.params;
+    const cancellationReason = resolveCancellationReason(req.body?.reasonCode);
 
     if (!bookingId) {
       return res.status(400).json({
-        status: 400,
+        success: false,
         message: "Booking ID is required"
       });
     }
 
-    // Find the booking
+    if (!cancellationReason) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_CANCELLATION_REASON",
+        message: "Please select a valid cancellation reason",
+      });
+    }
+
     const bookingData = await booking.findOne({ _id: bookingId, user_id: req.user_id });
     if (!bookingData) {
       return res.status(404).json({
-        status: 404,
+        success: false,
         message: "Booking not found"
       });
     }
 
-    // Check if booking is in pending status
-    if (bookingData.status !== "pending") {
-      return res.status(400).json({
-        status: 400,
-        message: `Cannot cancel booking with status: ${bookingData.status}. Only pending bookings can be cancelled.`
+    // Retried requests are idempotent. Do not refund or notify twice.
+    if (["user_cancelled", "cancelled"].includes(bookingData.status)) {
+      return res.status(200).json({
+        success: true,
+        message: "Booking is already cancelled",
+        data: bookingData,
       });
     }
 
-    // Update booking status to cancelled
+    if (!canCustomerCancel(bookingData.status, bookingData.dealerResponseStatus)) {
+      return res.status(409).json({
+        success: false,
+        code: "CANCELLATION_NOT_ALLOWED",
+        message: "This booking can no longer be cancelled because the service center has already responded.",
+      });
+    }
+
     const updatedBooking = await booking.findOneAndUpdate(
-      { _id: bookingId, user_id: req.user_id },
-      { $set: { status: "cancelled" } },
+      {
+        _id: bookingId,
+        user_id: req.user_id,
+        status: "pending",
+        dealerResponseStatus: { $ne: "expired" },
+      },
+      {
+        $set: {
+          status: "user_cancelled",
+          cancellationReasonCode: cancellationReason.code,
+          cancellationReason: cancellationReason.label,
+          cancelledAt: new Date(),
+          cancelledBy: req.user_id,
+        },
+      },
       { new: true }
     );
+
+    if (!updatedBooking) {
+      return res.status(409).json({
+        success: false,
+        code: "BOOKING_STATE_CHANGED",
+        message: "Booking status changed before it could be cancelled. Please refresh and try again.",
+      });
+    }
 
     try {
       await refundBookingMoney(updatedBooking);
@@ -2677,24 +2720,47 @@ async function cancelBooking(req, res) {
       console.error("[MR-BIKE-MONEY] Cancellation refund failed:", refundError.message);
     }
 
-    // Update tracking status if exists
-    await Tracking.updateOne(
-      { booking_id: bookingId },
-      { $set: { status: "cancelled" } }
-    );
-
-    // Send notification to user
-    const user = await customers.findById(bookingData.created_by);
-    if (user && (user.device_token || user.ftoken)) {
-      Notification(
-        user.device_token || user.ftoken,
-        `Your booking for ${bookingData.brand} ${bookingData.model} has been cancelled successfully`,
-        user.id
+    try {
+      await Tracking.updateOne(
+        { booking_id: bookingId },
+        { $set: { status: "cancelled", updatedAt: new Date() } }
       );
+    } catch (trackingError) {
+      console.error("Cancellation tracking update failed:", trackingError.message);
+    }
+
+    const io = req.app.get("io");
+    if (io) {
+      const payload = {
+        bookingId: String(updatedBooking._id),
+        status: updatedBooking.status,
+        cancellationReasonCode: cancellationReason.code,
+      };
+      io.to(`booking:${bookingId}`).emit("booking:cancelled", payload);
+      io.to(`dealer:${updatedBooking.dealer_id}`).emit("booking:cancelled", payload);
+    }
+
+    // The cancellation is already committed; notification failures must not
+    // turn a successful cancellation into an API error.
+    try {
+      const dealer = await Vendor.findById(updatedBooking.dealer_id)
+        .select("device_token ftoken")
+        .lean();
+      await sendBookingNotification({
+        token: dealer?.device_token || dealer?.ftoken,
+        title: "Booking Cancelled",
+        body: `The customer cancelled the booking: ${cancellationReason.label}.`,
+        data: {type: "booking_cancelled", bookingId: String(updatedBooking._id)},
+        receiverId: updatedBooking.dealer_id,
+        receiverType: "dealer",
+        bookingId: updatedBooking._id,
+      });
+    } catch (notifyError) {
+      console.error("Cancellation notification failed:", notifyError.message);
     }
 
     return res.status(200).json({
-      status: 200,
+      success: true,
       message: "Booking cancelled successfully",
       data: updatedBooking
     });
@@ -2702,7 +2768,7 @@ async function cancelBooking(req, res) {
   } catch (error) {
     console.error("Error cancelling booking:", error);
     return res.status(500).json({
-      status: 500,
+      success: false,
       message: "Internal Server Error",
     });
   }

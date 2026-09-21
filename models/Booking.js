@@ -118,6 +118,26 @@ const bookingSchema = new mongoose.Schema(
       default: "pending",
     },
 
+    // Customer cancellation audit trail. These fields are intentionally kept
+    // on the booking so support/admin clients can explain why a request ended.
+    cancellationReasonCode: {
+      type: String,
+      enum: [
+        "CHANGE_OF_PLANS",
+        "BOOKED_BY_MISTAKE",
+        "NEED_TO_RESCHEDULE",
+        "FOUND_ANOTHER_GARAGE",
+        "PRICE_CONCERN",
+        "LOCATION_CONCERN",
+        "OTHER",
+        null,
+      ],
+      default: null,
+    },
+    cancellationReason: {type: String, default: null, trim: true, maxlength: 120},
+    cancelledAt: {type: Date, default: null},
+    cancelledBy: {type: mongoose.Schema.Types.ObjectId, ref: "customers", default: null},
+
     dealerResponseStatus: {
       type: String,
       enum: ["awaiting", "accepted", "rejected", "expired"],
