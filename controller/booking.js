@@ -15,6 +15,7 @@ const { generateBill } = require("../controller/payment")
 const { getOrCreateInvoice } = require("../services/invoiceService")
 const { settleBookingWallet } = require("../helper/walletSettlement")
 const { cancelPendingPaymentSessions } = require("../helper/paymentSession")
+const { deleteS3Object } = require("../utils/s3Upload")
 const UserBike = require("../models/userBikeModel");
 const AdminService = require("../models/adminService");
 const Customer = require("../models/customer_model");
@@ -3622,6 +3623,185 @@ async function updateTowingCharge(req, res) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+
+/* ======================================================================
+   COMPLETION PHOTOS  —  ADMIN-INTERNAL SERVICE RECORD
+   ----------------------------------------------------------------------
+   Photos of the finished work, uploaded by the garage from the partner app
+   before it marks the service complete. They exist so MR Bike staff can audit
+   what a garage actually did; they are NOT customer-facing and must never be
+   returned by a customer endpoint.
+
+   Two things keep that true:
+     1. `completionPhotos` is `select: false` on the schema, so it is absent
+        from every booking query in the codebase unless a handler asks for it
+        by name. Only the three handlers below do.
+     2. All three sit behind requireBookingParticipant (which 404s a dealer who
+        does not own the booking) AND an explicit role gate — dealer-only for
+        the writes, dealer-or-admin for the read. A customer authenticated on
+        their own booking is rejected by the role gate.
+
+   Storage reuses utils/s3Upload.js#createS3Upload, the same multer-S3 factory
+   behind dealer documents, review images and shop images. There is no
+   pre-signed-upload infrastructure in this project, so there is nothing to
+   reuse there and nothing new is introduced here.
+====================================================================== */
+
+// Shape a stored subdocument for the wire. Keeps the S3 `key` server-side:
+// clients render `url` and address a photo by its `_id`, so no endpoint needs
+// to accept a raw bucket key from a client.
+const toCompletionPhotoResponse = (photo) => ({
+  _id: photo._id,
+  url: photo.url,
+  mimeType: photo.mimeType || null,
+  uploadedAt: photo.uploadedAt || null,
+});
+
+// Cap per booking. A completed service is a handful of photos; this stops a
+// single booking's array (and the S3 folder) growing without bound.
+const MAX_COMPLETION_PHOTOS = 12;
+
+/**
+ * POST /bookings/:bookingId/completion-photos   (dealer who owns the booking)
+ * multipart/form-data, field name `photos` — see routes/bookingRoutes.js for
+ * the multer-S3 middleware. By the time this runs the files are already in S3,
+ * so all that is left is recording them on the booking.
+ */
+async function uploadCompletionPhotos(req, res) {
+  try {
+    const { bookingId } = req.params;
+    const files = req.files || [];
+
+    if (files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No photos were uploaded. Attach at least one file as `photos`.",
+      });
+    }
+
+    const bookingDoc = await booking
+      .findById(bookingId)
+      .select("+completionPhotos");
+    if (!bookingDoc) {
+      // The uploads already landed in S3 before we got here, so clean them up
+      // rather than leaving orphans in the bucket.
+      await Promise.all(files.map((file) => deleteS3Object(file.key || file.location)));
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const existing = bookingDoc.completionPhotos || [];
+    if (existing.length + files.length > MAX_COMPLETION_PHOTOS) {
+      await Promise.all(files.map((file) => deleteS3Object(file.key || file.location)));
+      return res.status(400).json({
+        success: false,
+        message: `A booking can hold at most ${MAX_COMPLETION_PHOTOS} completion photos (${existing.length} already uploaded).`,
+      });
+    }
+
+    const added = files.map((file) => ({
+      url: file.location || file.path,
+      key: file.key || null,
+      mimeType: file.mimetype || null,
+      uploadedAt: new Date(),
+      uploadedBy: req.user_id,
+    }));
+
+    bookingDoc.completionPhotos = [...existing, ...added];
+    await bookingDoc.save();
+
+    console.log(
+      `[COMPLETION-PHOTOS] Booking ${bookingId}: +${added.length} photo(s) by dealer ${req.user_id}`
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: `${added.length} photo${added.length === 1 ? "" : "s"} uploaded`,
+      data: bookingDoc.completionPhotos.map(toCompletionPhotoResponse),
+    });
+  } catch (error) {
+    console.error("[COMPLETION-PHOTOS] upload error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+}
+
+/**
+ * GET /bookings/:bookingId/completion-photos   (owning dealer, or any admin)
+ * The only read path for this field anywhere in the API.
+ */
+async function getCompletionPhotos(req, res) {
+  try {
+    const { bookingId } = req.params;
+
+    const bookingDoc = await booking
+      .findById(bookingId)
+      .select("+completionPhotos")
+      .lean();
+    if (!bookingDoc) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: (bookingDoc.completionPhotos || []).map(toCompletionPhotoResponse),
+    });
+  } catch (error) {
+    console.error("[COMPLETION-PHOTOS] fetch error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+}
+
+/**
+ * DELETE /bookings/:bookingId/completion-photos/:photoId   (owning dealer)
+ * Lets a garage drop a photo it took by mistake. Admins deliberately cannot
+ * delete here — this is the garage's own record of its work, and the audit
+ * value of these photos depends on staff not being able to quietly remove
+ * them.
+ */
+async function deleteCompletionPhoto(req, res) {
+  try {
+    const { bookingId, photoId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(photoId)) {
+      return res.status(400).json({ success: false, message: "Invalid photo id" });
+    }
+
+    const bookingDoc = await booking
+      .findById(bookingId)
+      .select("+completionPhotos");
+    if (!bookingDoc) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const photo = (bookingDoc.completionPhotos || []).find(
+      (item) => String(item._id) === String(photoId)
+    );
+    if (!photo) {
+      return res.status(404).json({ success: false, message: "Photo not found on this booking" });
+    }
+
+    bookingDoc.completionPhotos = bookingDoc.completionPhotos.filter(
+      (item) => String(item._id) !== String(photoId)
+    );
+    await bookingDoc.save();
+
+    // Drop the object too, the same way a replaced dealer document is cleaned
+    // up. deleteS3Object logs and swallows its own errors, so a bucket hiccup
+    // never fails a delete the database has already committed.
+    await deleteS3Object(photo.key || photo.url);
+
+    console.log(`[COMPLETION-PHOTOS] Booking ${bookingId}: removed photo ${photoId}`);
+
+    return res.status(200).json({
+      success: true,
+      message: "Photo removed",
+      data: bookingDoc.completionPhotos.map(toCompletionPhotoResponse),
+    });
+  } catch (error) {
+    console.error("[COMPLETION-PHOTOS] delete error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+}
+
 module.exports = {
   addbooking,
   getallbookings,
@@ -3651,4 +3831,7 @@ module.exports = {
   confirmCashReceived,
   verifyDeliveryOtp,
   regenerateDeliveryOtp,
+  uploadCompletionPhotos,
+  getCompletionPhotos,
+  deleteCompletionPhoto,
 }

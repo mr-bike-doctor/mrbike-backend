@@ -193,6 +193,58 @@ const bookingSchema = new mongoose.Schema(
       },
     ],
 
+    // ── Completion photos (ADMIN-INTERNAL) ───────────────────────────────────
+    // Photos the garage takes of the finished work, uploaded from the partner
+    // app before marking a service complete. They are an internal service
+    // record for MR Bike staff: the dealer who owns the booking may add, view
+    // and remove them, an admin may view them, and the CUSTOMER MUST NEVER
+    // RECEIVE THEM.
+    //
+    // `select: false` is what enforces that, and it is the same mechanism this
+    // schema already uses for pickupOtp/pickupOtpExpiresAt: the path is left
+    // out of every query — getBookingDetails, getuserbookings, getbooking,
+    // getallbookings, createBooking — unless a handler explicitly asks for it
+    // with .select("+completionPhotos"). Only the three completion-photo
+    // endpoints in controller/booking.js do, and all three are dealer/admin
+    // only. Adding the field to a customer response therefore takes a
+    // deliberate opt-in, not an oversight.
+    //
+    // Mongoose omits unselected paths from the update it builds on save(), so
+    // the many handlers that load a booking without this field and call
+    // save() (serviceComplete, updateBooking, the pickup lifecycle, …) cannot
+    // accidentally wipe the array.
+    completionPhotos: {
+      type: [
+        {
+          // multerS3 `.location` — the absolute S3 URL the apps render.
+          url: { type: String, required: true },
+          // multerS3 `.key` — kept so deleteS3Object() can remove the object
+          // when a dealer deletes a photo, exactly as dealer documents do.
+          key: { type: String, default: null },
+          mimeType: { type: String, default: null },
+          uploadedAt: { type: Date, default: Date.now },
+          // Which dealer uploaded it. Always the booking's own dealer today;
+          // stored so an admin auditing the record can see it without
+          // cross-referencing the booking.
+          uploadedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Vendor",
+            default: null,
+          },
+        },
+      ],
+      // `default: undefined` rather than `[]` on purpose. Mongoose gives array
+      // paths an automatic `[]` default, and that default is applied at
+      // CONSTRUCTION — `select: false` only governs queries. So with a default
+      // the field would reappear as `completionPhotos: []` on
+      // `newBooking.toObject()` in createBooking, which is a customer
+      // response. Suppressing the default keeps the path absent until a dealer
+      // actually uploads something. Readers must therefore treat it as
+      // possibly-undefined (`booking.completionPhotos || []`).
+      default: undefined,
+      select: false,
+    },
+
     // 🔄 replaced single 'otp' with two distinct OTPs
     pickupOtp: { type: Number, default: null, select: false },
     deliveryOtp: { type: Number, default: null },
