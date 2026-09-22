@@ -293,10 +293,41 @@ const createDynamicUpiQrOrder = async ({ booking, bookingId, amount, customerDet
     },
   }
 
-  const orderResponse = await axios.post(`${getCashfreeBaseUrl()}/orders`, orderPayload, {
-    headers: getCashfreeHeaders({ "x-idempotency-key": idempotencyKeyFor("order", orderId) }),
-  })
+  let orderResponse
+  try {
+    orderResponse = await axios.post(`${getCashfreeBaseUrl()}/orders`, orderPayload, {
+      headers: getCashfreeHeaders({ "x-idempotency-key": idempotencyKeyFor("order", orderId) }),
+    })
+  } catch (error) {
+    console.error("[CASHFREE] Create Order failed", {
+      orderId,
+      status: error.response?.status,
+      code: error.response?.data?.code,
+      type: error.response?.data?.type,
+      message: error.response?.data?.message || error.message,
+      order_expiry_time_sent: expiryTime,
+    })
+    const createError = new Error(
+      `Cashfree rejected the payment order: ${sanitizeCashfreeError(error)}`,
+    )
+    createError.code = "CASHFREE_ORDER_CREATE_FAILED"
+    createError.status = error.response?.status
+    throw createError
+  }
   const orderData = orderResponse.data || {}
+  const cashfreeExpiry = orderData.order_expiry_time || expiryTime
+  const msRemaining = new Date(cashfreeExpiry).getTime() - Date.now()
+  console.log("[CASHFREE] Order created", {
+    orderId,
+    cf_order_id: orderData.cf_order_id,
+    order_status: orderData.order_status,
+    payment_session_id_present: Boolean(orderData.payment_session_id),
+    server_now: new Date().toISOString(),
+    order_expiry_time_sent: expiryTime,
+    cashfree_expiry_returned: orderData.order_expiry_time || null,
+    milliseconds_remaining: msRemaining,
+    minutes_remaining: Number((msRemaining / 60000).toFixed(2)),
+  })
   const paymentSessionId = orderData.payment_session_id
   if (!paymentSessionId) {
     const sessionError = new Error("Cashfree did not return a payment session for the order")
@@ -542,7 +573,27 @@ const generateUPIQRCode = async (req, res) => {
     // Cancel any still-pending session from an earlier QR (dealer switched
     // method, the QR expired, or the dealer asked for a fresh one) so only
     // the order below stays payable — never two live QR codes at once.
-    await cancelPendingPaymentSessions(booking_id)
+    // Retiring the previous attempt is housekeeping, not the payment itself.
+    // A stale PAYMENT_LINK or a long-expired PG order must never keep the
+    // dealer from minting a fresh QR, and its gateway message must never be
+    // mistaken for a verdict on THIS request.
+    try {
+      await cancelPendingPaymentSessions(booking_id, "qr_regenerated")
+    } catch (cleanupError) {
+      if (cleanupError.code === "CASHFREE_ORDER_ALREADY_PAID") throw cleanupError
+      console.error("[CASHFREE] Could not retire the previous payment attempt", {
+        bookingId: booking_id,
+        status: cleanupError.response?.status,
+        code: cleanupError.response?.data?.code,
+        type: cleanupError.response?.data?.type,
+        message: cleanupError.response?.data?.message || cleanupError.message,
+      })
+      const blocked = new Error(
+        `The previous payment attempt is still live and could not be closed: ${sanitizeCashfreeError(cleanupError)}`,
+      )
+      blocked.code = "CASHFREE_CLEANUP_FAILED"
+      throw blocked
+    }
 
     // Customer details from booking or request
     const customerDetails = {
@@ -632,7 +683,12 @@ const generateUPIQRCode = async (req, res) => {
     }
     // Cashfree refused to produce a Dynamic UPI QR. Surface the real reason
     // to the dealer app — there is no hosted-checkout substitute.
-    if (error.code === "CASHFREE_QR_UNAVAILABLE" || error.code === "CASHFREE_SESSION_MISSING") {
+    if (
+      error.code === "CASHFREE_QR_UNAVAILABLE" ||
+      error.code === "CASHFREE_SESSION_MISSING" ||
+      error.code === "CASHFREE_ORDER_CREATE_FAILED" ||
+      error.code === "CASHFREE_CLEANUP_FAILED"
+    ) {
       return res.status(502).json({
         success: false,
         code: error.code,
@@ -642,10 +698,16 @@ const generateUPIQRCode = async (req, res) => {
     // Return Cashfree's validation message to the authenticated dealer app so
     // a configuration/validation failure is diagnosable, without exposing
     // credentials or the upstream response body.
+    // The upstream text is kept as detail, never as the whole message: a
+    // gateway phrase such as "Payment request expired." read as this
+    // endpoint's own verdict is what made a recoverable cleanup failure look
+    // like a dead booking to the dealer app.
     const upstreamMessage = error.response?.data?.message || error.response?.data?.type
     res.status(error.response?.status >= 400 && error.response?.status < 500 ? 422 : 500).json({
       success: false,
-      message: upstreamMessage || "Failed to generate UPI QR Code",
+      message: upstreamMessage
+        ? `Failed to generate UPI QR Code: ${upstreamMessage}`
+        : "Failed to generate UPI QR Code",
     })
   } finally {
     if (paymentOrderLockToken && lockedBookingId) {

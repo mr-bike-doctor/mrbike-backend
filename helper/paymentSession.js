@@ -53,6 +53,28 @@ async function releasePaymentOrderLock(bookingId, token) {
   );
 }
 
+// Cashfree's 4xx codes for "cannot cancel" are not a fixed set, so we never
+// branch on the status. What matters is a single question: is the remote
+// resource STILL PAYABLE? A link/order that is already expired, cancelled,
+// terminated — or that Cashfree no longer knows about — is exactly the state
+// the cleanup wanted, so it has already succeeded.
+const PAYABLE_LINK_STATUSES = ["ACTIVE"];
+const PAYABLE_ORDER_STATUSES = ["ACTIVE"];
+const RESOURCE_GONE = "__GONE__";
+
+// Read the remote state after a cancel/terminate was refused. A 404 means the
+// resource does not exist, which is terminal and safe. Anything else is
+// unverifiable, so the original refusal is re-thrown by the caller.
+async function readRemoteStatus(url, headers, field) {
+  try {
+    const response = await axios.get(url, { headers });
+    return response.data?.[field] || null;
+  } catch (error) {
+    if (error.response?.status === 404) return RESOURCE_GONE;
+    return null;
+  }
+}
+
 async function terminateCashfreeOrder(payment) {
   if (!payment?.orderId) return;
   const idempotencyHex = crypto
@@ -60,56 +82,58 @@ async function terminateCashfreeOrder(payment) {
     .update(`terminate:${payment.orderId}`)
     .digest("hex");
   const idempotencyKey = `${idempotencyHex.slice(0, 8)}-${idempotencyHex.slice(8, 12)}-4${idempotencyHex.slice(13, 16)}-a${idempotencyHex.slice(17, 20)}-${idempotencyHex.slice(20, 32)}`;
+  const headers = cashfreeHeaders(idempotencyKey);
 
   const isPaymentLink = payment?.metadata?.cashfree_resource === "PAYMENT_LINK";
-  let response;
-  if (isPaymentLink) {
-    try {
-      response = await axios.post(
-        `${CASHFREE_LINKS_URL}/${encodeURIComponent(payment.orderId)}/cancel`,
-        {},
-        { headers: cashfreeHeaders(idempotencyKey) },
-      );
-    } catch (error) {
-      if (![409, 422].includes(error.response?.status)) throw error;
-      response = await axios.get(
-        `${CASHFREE_LINKS_URL}/${encodeURIComponent(payment.orderId)}`,
-        { headers: cashfreeHeaders(idempotencyKey) },
-      );
-    }
-    if (response.data?.link_status === "PAID") {
-      const error = new Error(`Cashfree payment link ${payment.orderId} is already paid`);
-      error.code = "CASHFREE_ORDER_ALREADY_PAID";
-      throw error;
-    }
-    if (!["CANCELLED", "EXPIRED"].includes(response.data?.link_status)) {
-      throw new Error(`Cashfree did not cancel payment link ${payment.orderId}`);
-    }
-    return;
-  }
+  const baseUrl = isPaymentLink
+    ? `${CASHFREE_LINKS_URL}/${encodeURIComponent(payment.orderId)}`
+    : `${CASHFREE_ORDERS_URL}/${encodeURIComponent(payment.orderId)}`;
+  const statusField = isPaymentLink ? "link_status" : "order_status";
+  const payableStatuses = isPaymentLink ? PAYABLE_LINK_STATUSES : PAYABLE_ORDER_STATUSES;
 
+  let status = null;
+  let refusal = null;
   try {
-    response = await axios.patch(
-      `${CASHFREE_ORDERS_URL}/${encodeURIComponent(payment.orderId)}`,
-      { order_status: "TERMINATED" },
-      { headers: cashfreeHeaders(idempotencyKey) },
-    );
+    const response = isPaymentLink
+      ? await axios.post(`${baseUrl}/cancel`, {}, { headers })
+      : await axios.patch(baseUrl, { order_status: "TERMINATED" }, { headers });
+    status = response.data?.[statusField] || null;
   } catch (error) {
-    if (![409, 422].includes(error.response?.status)) throw error;
-    response = await axios.get(
-      `${CASHFREE_ORDERS_URL}/${encodeURIComponent(payment.orderId)}`,
-      { headers: cashfreeHeaders(idempotencyKey) },
-    );
+    // A transport failure or a 5xx is a genuine outage — surface it. Any 4xx
+    // is Cashfree telling us the resource is not in a cancellable state, so
+    // ask what state it IS in rather than aborting the whole QR flow. This is
+    // the path an already-expired PAYMENT_LINK takes: /links/{id}/cancel
+    // answers 400 "Payment request expired.", which used to escape this
+    // helper and surface to the dealer app as a 422 on generate-qr.
+    const upstreamStatus = error.response?.status;
+    if (!upstreamStatus || upstreamStatus >= 500) throw error;
+    console.warn("[CASHFREE] Cancel refused, verifying remote state", {
+      orderId: payment.orderId,
+      resource: isPaymentLink ? "PAYMENT_LINK" : "PG_ORDER",
+      status: upstreamStatus,
+      code: error.response?.data?.code,
+      type: error.response?.data?.type,
+      message: error.response?.data?.message,
+    });
+    refusal = error;
+    status = await readRemoteStatus(baseUrl, headers, statusField);
   }
 
-  if (response.data?.order_status === "PAID") {
-    const error = new Error(`Cashfree order ${payment.orderId} is already paid`);
+  if (status === "PAID") {
+    const error = new Error(
+      `Cashfree ${isPaymentLink ? "payment link" : "order"} ${payment.orderId} is already paid`,
+    );
     error.code = "CASHFREE_ORDER_ALREADY_PAID";
     throw error;
   }
-  if (!["TERMINATED", "TERMINATION_REQUESTED", "EXPIRED"].includes(response.data?.order_status)) {
-    throw new Error(`Cashfree did not terminate order ${payment.orderId}`);
-  }
+  // Gone, expired, cancelled, terminated, termination-requested: not payable,
+  // so the cleanup is done and a fresh order may be minted.
+  if (status === RESOURCE_GONE) return;
+  if (status && !payableStatuses.includes(status)) return;
+  // Either Cashfree still considers it payable, or we could not read its
+  // state at all. Both are unsafe — two live payables for one booking.
+  if (refusal) throw refusal;
+  throw new Error(`Cashfree did not cancel ${payment.orderId} (status: ${status || "unknown"})`);
 }
 
 /**
@@ -123,16 +147,22 @@ async function terminateCashfreeOrder(payment) {
  * @param {string|ObjectId} bookingId
  * @returns {number} how many pending sessions were cancelled
  */
-async function cancelPendingPaymentSessions(bookingId) {
+async function cancelPendingPaymentSessions(bookingId, reason = "payment_method_changed") {
   const pendingPayments = await Payment.find({ booking_id: bookingId, order_status: "PENDING" });
   for (const payment of pendingPayments) {
     await terminateCashfreeOrder(payment);
-    payment.order_status = "CANCELLED";
+    // A row whose own QR lifetime already elapsed is recorded as EXPIRED so
+    // the history says what actually happened; anything else we tore down
+    // deliberately is CANCELLED. Either way it leaves PENDING, which is what
+    // frees the one_pending_payment_per_booking index for the fresh order.
+    const expiresAt = new Date(payment.metadata?.expiry_time || 0).getTime();
+    const lapsed = !Number.isFinite(expiresAt) || expiresAt <= Date.now();
+    payment.order_status = lapsed ? "EXPIRED" : "CANCELLED";
     payment.gateway_status = "TERMINATED";
     payment.metadata = {
       ...payment.metadata,
       cancelled_at: new Date(),
-      cancelled_reason: "payment_method_changed",
+      cancelled_reason: reason,
       cashfree_termination_requested: true,
     };
     await payment.save();
@@ -145,4 +175,5 @@ module.exports = {
   releasePaymentOrderLock,
   terminateCashfreeOrder,
   cancelPendingPaymentSessions,
+  __testing: { readRemoteStatus, RESOURCE_GONE },
 };
