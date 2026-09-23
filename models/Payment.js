@@ -90,6 +90,20 @@ const paymentSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    // Booking softPOS Dynamic QR (metadata.cashfree_resource = "SOFTPOS_QR")
+    // only. Null on wallet top-ups and historical PG_ORDER / PAYMENT_LINK rows.
+    cf_terminal_id: {
+      type: String,
+      default: null,
+    },
+    payment_attempt: {
+      type: Number,
+      default: null,
+    },
+    expires_at: {
+      type: Date,
+      default: null,
+    },
     // Top-up only: guards a single Vendor.wallet + Wallet ledger credit for a
     // successful Cashfree order across webhooks and authenticated status polls.
     wallet_credit_state: {

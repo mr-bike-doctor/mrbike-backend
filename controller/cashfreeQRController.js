@@ -1,6 +1,5 @@
 const axios = require("axios")
 const QRCode = require("qrcode")
-const crypto = require("crypto")
 const Payment = require("../models/Payment")
 const Booking = require("../models/Booking")
 const Customer = require("../models/customer_model")
@@ -14,6 +13,8 @@ const {
   cancelPendingPaymentSessions,
   terminateCashfreeOrder,
 } = require("../helper/paymentSession")
+const softpos = require("../services/cashfreeSoftposService")
+const { CASHFREE_RESOURCE_SOFTPOS_QR } = softpos
 const {
   enqueuePaymentReconciliation,
   completeReconciliationTask,
@@ -26,8 +27,10 @@ const QR_DATA_URI_PREFIX = "data:image/png;base64,"
 // Payment Link URL. Kept only so historical rows stay readable and
 // checkable — nothing new is ever created with this resource type.
 const CASHFREE_RESOURCE_PAYMENT_LINK = "PAYMENT_LINK"
-// Current booking flow: a PG order paid through the UPI "qrcode" channel,
-// i.e. a real Cashfree Dynamic UPI QR the customer's UPI app understands.
+// Legacy booking payments: a PG order paid through Order Pay's UPI "qrcode"
+// channel. Also read-only now — new attempts are SOFTPOS_QR (see
+// services/cashfreeSoftposService.js). Historical rows keep their status,
+// webhook and cancel paths.
 const CASHFREE_RESOURCE_PG_ORDER = "PG_ORDER"
 const AMOUNT_TOLERANCE = 0.01
 
@@ -42,6 +45,9 @@ const normalizeQrCode = (value) => {
 
 const isPaymentLink = (payment) =>
   payment?.metadata?.cashfree_resource === CASHFREE_RESOURCE_PAYMENT_LINK
+
+const isSoftposQr = (payment) =>
+  payment?.metadata?.cashfree_resource === CASHFREE_RESOURCE_SOFTPOS_QR
 
 const getQrExpiryMinutes = () => {
   const configured = Number.parseInt(process.env.CASHFREE_QR_EXPIRY_MINUTES, 10)
@@ -61,47 +67,6 @@ const buildExpiryIso = (minutesFromNow) => {
 const isExpired = (payment) => {
   const expiry = new Date(payment?.metadata?.expiry_time || 0).getTime()
   return !Number.isFinite(expiry) || expiry <= Date.now()
-}
-
-/**
- * Pull the Dynamic UPI QR out of a Cashfree Order Pay (POST /pg/orders/sessions)
- * response.
- *
- * The one thing this must never do is accept a hosted-checkout address. A
- * payments.cashfree.com / https URL rendered into a QR is what made customers
- * land on Cashfree's web checkout instead of paying from PhonePe/GPay, so an
- * http(s) value is treated as "no QR returned", not as a fallback.
- *
- * Accepted: a base64 PNG (Cashfree's `data.payload.qrcode`) or a `upi://`
- * intent string, which is a genuine UPI payload with the amount baked in.
- */
-const extractDynamicQr = (payOrderResponse) => {
-  const payload = payOrderResponse?.data?.payload || {}
-  const candidates = [
-    payload.qrcode,
-    payload.default_qr_code,
-    payload.bqrdata,
-    payload.default,
-    payOrderResponse?.data?.url,
-  ].filter((value) => typeof value === "string" && value.trim())
-
-  for (const candidate of candidates) {
-    const value = candidate.trim()
-    if (/^https?:\/\//i.test(value)) continue
-    if (value.toLowerCase().startsWith("upi://")) {
-      return { kind: "upi_intent", value }
-    }
-    // A data URI is unambiguous. A bare base64 blob is only accepted when it
-    // is long enough to actually be a QR image, so a short status-ish word
-    // sitting in the payload can never be mistaken for one.
-    if (value.startsWith(QR_DATA_URI_PREFIX)) {
-      return { kind: "image", value }
-    }
-    if (value.length >= 100 && /^[A-Za-z0-9+/=\s]+$/.test(value)) {
-      return { kind: "image", value }
-    }
-  }
-  return null
 }
 
 // Cashfree is the authority on what was paid; the booking is the authority on
@@ -241,175 +206,11 @@ const getCashfreeHeaders = (additionalHeaders = {}) => ({
   ...additionalHeaders,
 });
 
-// Cashfree makes a create-order retry safe when the same idempotency key is
-// replayed. Deriving it from our own order_id (which already carries a
-// timestamp and a random suffix) means a network retry of THIS attempt
-// returns the same order instead of minting a second payable one.
-const idempotencyKeyFor = (scope, value) => {
-  const hex = crypto.createHash("sha256").update(`${scope}:${value}`).digest("hex")
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
-}
-
 const sanitizeCashfreeError = (error) =>
   error.response?.data?.message ||
   error.response?.data?.type ||
   error.response?.data?.code ||
   error.message
-
-/**
- * Create a Cashfree PG order and immediately pay it through the UPI "qrcode"
- * channel, returning the Dynamic UPI QR that Cashfree generated for exactly
- * this amount.
- *
- * POST /pg/orders          → payment_session_id
- * POST /pg/orders/sessions → data.payload.qrcode  (base64 PNG dynamic UPI QR)
- *
- * There is deliberately NO fallback. The previous implementation caught the
- * Order Pay failure and rendered a QR from the hosted-checkout URL, which is
- * exactly the bug this flow exists to fix: a customer scanning an https QR
- * gets a web page, not a UPI payment. If Cashfree will not give us a QR, the
- * dealer must see the real error.
- */
-const createDynamicUpiQrOrder = async ({ booking, bookingId, amount, customerDetails }) => {
-  const orderId = `BIKEDOC_${Date.now()}_${Math.random().toString(36).slice(2, 8).toUpperCase()}`
-  const expiryMinutes = getQrExpiryMinutes()
-  const expiryTime = buildExpiryIso(expiryMinutes)
-
-  const orderPayload = {
-    order_id: orderId,
-    order_amount: Number.parseFloat(amount),
-    order_currency: "INR",
-    customer_details: customerDetails,
-    order_meta: {
-      return_url: `${process.env.FRONTEND_URL || "https://bikedoctor.app"}/payment-status?order_id={order_id}`,
-      notify_url: `${process.env.BACKEND_URL || "https://api.bikedoctor.app"}/bikedoctor/cashfree/webhook`,
-      payment_methods: "upi",
-    },
-    order_expiry_time: expiryTime,
-    order_note: `Payment for Booking ${booking?.bookingId || bookingId}`,
-    order_tags: {
-      booking_id: bookingId.toString(),
-      dealer_id: booking?.dealer_id?._id?.toString() || "",
-    },
-  }
-
-  let orderResponse
-  try {
-    orderResponse = await axios.post(`${getCashfreeBaseUrl()}/orders`, orderPayload, {
-      headers: getCashfreeHeaders({ "x-idempotency-key": idempotencyKeyFor("order", orderId) }),
-    })
-  } catch (error) {
-    console.error("[CASHFREE] Create Order failed", {
-      orderId,
-      status: error.response?.status,
-      code: error.response?.data?.code,
-      type: error.response?.data?.type,
-      message: error.response?.data?.message || error.message,
-      order_expiry_time_sent: expiryTime,
-    })
-    const createError = new Error(
-      `Cashfree rejected the payment order: ${sanitizeCashfreeError(error)}`,
-    )
-    createError.code = "CASHFREE_ORDER_CREATE_FAILED"
-    createError.status = error.response?.status
-    throw createError
-  }
-  const orderData = orderResponse.data || {}
-  const cashfreeExpiry = orderData.order_expiry_time || expiryTime
-  const msRemaining = new Date(cashfreeExpiry).getTime() - Date.now()
-  console.log("[CASHFREE] Order created", {
-    orderId,
-    cf_order_id: orderData.cf_order_id,
-    order_status: orderData.order_status,
-    payment_session_id_present: Boolean(orderData.payment_session_id),
-    server_now: new Date().toISOString(),
-    order_expiry_time_sent: expiryTime,
-    cashfree_expiry_returned: orderData.order_expiry_time || null,
-    milliseconds_remaining: msRemaining,
-    minutes_remaining: Number((msRemaining / 60000).toFixed(2)),
-  })
-  const paymentSessionId = orderData.payment_session_id
-  if (!paymentSessionId) {
-    const sessionError = new Error("Cashfree did not return a payment session for the order")
-    sessionError.code = "CASHFREE_SESSION_MISSING"
-    throw sessionError
-  }
-
-  let payOrderResponse
-  try {
-    const response = await axios.post(
-      `${getCashfreeBaseUrl()}/orders/sessions`,
-      {
-        payment_session_id: paymentSessionId,
-        payment_method: { upi: { channel: "qrcode" } },
-      },
-      { headers: getCashfreeHeaders({ "x-idempotency-key": idempotencyKeyFor("session", orderId) }) },
-    )
-    payOrderResponse = response.data || {}
-  } catch (error) {
-    // Log the upstream body server-side (S2S disabled, UPI not enabled on the
-    // merchant, amount limits...) so the failure is diagnosable, then fail.
-    console.error("[CASHFREE] Order Pay (UPI qrcode) failed", {
-      orderId,
-      status: error.response?.status,
-      body: error.response?.data,
-      message: error.message,
-    })
-    await terminateCashfreeOrder({ orderId }).catch((cleanupError) => {
-      console.error("[CASHFREE] Could not terminate order after QR failure", {
-        orderId,
-        message: cleanupError.message,
-      })
-    })
-    const qrError = new Error(sanitizeCashfreeError(error) || "Cashfree could not generate a UPI QR for this order")
-    qrError.code = "CASHFREE_QR_UNAVAILABLE"
-    qrError.status = error.response?.status
-    throw qrError
-  }
-
-  const dynamicQr = extractDynamicQr(payOrderResponse)
-  if (!dynamicQr) {
-    console.error("[CASHFREE] Order Pay returned no usable UPI QR payload", {
-      orderId,
-      action: payOrderResponse.action,
-      channel: payOrderResponse.channel,
-      payloadKeys: Object.keys(payOrderResponse?.data?.payload || {}),
-      dataKeys: Object.keys(payOrderResponse?.data || {}),
-    })
-    await terminateCashfreeOrder({ orderId }).catch(() => {})
-    const qrError = new Error("Cashfree did not return a UPI QR for this order")
-    qrError.code = "CASHFREE_QR_UNAVAILABLE"
-    throw qrError
-  }
-
-  // A upi:// intent is already a valid dynamic UPI payload with the amount
-  // baked in; rendering it locally produces the same scannable QR. A base64
-  // image from Cashfree is used exactly as returned.
-  const { qrCodeDataUrl, qrCodeBase64 } =
-    dynamicQr.kind === "image"
-      ? normalizeQrCode(dynamicQr.value)
-      : normalizeQrCode(
-          await QRCode.toDataURL(dynamicQr.value, {
-            width: 400,
-            margin: 2,
-            color: { dark: "#000000", light: "#FFFFFF" },
-            errorCorrectionLevel: "M",
-          }),
-        )
-
-  return {
-    orderId,
-    orderData,
-    paymentSessionId,
-    expiryTime,
-    qrCodeDataUrl,
-    qrCodeBase64,
-    qrSource: dynamicQr.kind,
-    upiIntent: dynamicQr.kind === "upi_intent" ? dynamicQr.value : null,
-    cfPaymentId: payOrderResponse.cf_payment_id ? String(payOrderResponse.cf_payment_id) : null,
-    payOrderAmount: payOrderResponse.payment_amount,
-  }
-}
 
 const getVerifiedPaymentDetails = async (orderId, fallback = {}) => {
   try {
@@ -447,6 +248,292 @@ const getCashfreePaymentLink = async (linkId) => {
     cf_payment_id: latestOrder?.cf_payment_id,
     payment_group: latestOrder?.payment_group,
     bank_reference: latestOrder?.bank_reference,
+  }
+}
+
+const PAYMENT_METHOD_VALUES = ["card", "netbanking", "upi", "wallet", "emi", "qrcode"]
+
+/**
+ * Server-side verdict on one SOFTPOS_QR attempt, shared by the status poll,
+ * the webhook and generate-qr. Cashfree's Orders API is the only source of
+ * truth; nothing a client or a webhook body says is trusted.
+ *
+ * Returns { state, isPaid } where state is one of
+ *   PAID     — Cashfree order PAID (isPaid only if every amount check passed)
+ *   PENDING  — QR still live and payable
+ *   EXPIRED  — QR timeout passed (order may still be ACTIVE until retired)
+ *   FAILED   — the terminal transaction failed / was dropped
+ *   CLOSED   — Cashfree order itself expired/terminated
+ *
+ * A PENDING row is never moved to EXPIRED/CANCELLED here while Cashfree still
+ * reports the order ACTIVE: a late UPI confirmation must still land on a
+ * PENDING row and complete the booking. Retiring a live-but-dead attempt is
+ * done only by cancelPendingPaymentSessions, which terminates the order at
+ * Cashfree first and refuses if it turns out to be PAID.
+ */
+const reconcileSoftposPayment = async (payment, io) => {
+  const order = await softpos.fetchOrder(payment.orderId)
+  const orderStatus = String(order.order_status || "").toUpperCase()
+  const now = new Date()
+  const baseMeta = {
+    "metadata.last_status_check": now,
+    "metadata.cashfree_status": orderStatus || null,
+  }
+
+  if (orderStatus === "PAID") {
+    const payments = await softpos.fetchOrderPayments(payment.orderId)
+    const successful = payments.find((item) => item?.payment_status === "SUCCESS")
+    if (!successful) {
+      // PAID order without a SUCCESS payment is not something we act on.
+      await Payment.updateOne({ _id: payment._id }, { $set: baseMeta })
+      return { state: "PENDING", isPaid: false }
+    }
+
+    // Money owed is decided by the booking, not by the order we created and
+    // not by Cashfree: all three must agree before the booking advances.
+    const booking = await Booking.findById(payment.booking_id).select("customerTotal discountAmount")
+    const paidAmount = Number(successful.payment_amount)
+    const amountVerified =
+      amountMatches(payment.orderAmount, paidAmount) &&
+      amountMatches(payment.orderAmount, order.order_amount) &&
+      Boolean(booking) &&
+      amountMatches(booking.amountDue, paidAmount)
+
+    const wasRetired = ["CANCELLED", "EXPIRED", "FAILED"].includes(payment.order_status)
+    const paymentGroup = String(successful.payment_group || "").toLowerCase()
+    const verifiedFields = {
+      order_status: "SUCCESS",
+      cf_payment_id: successful.cf_payment_id != null ? String(successful.cf_payment_id) : payment.cf_payment_id,
+      transaction_id: successful.cf_payment_id != null ? String(successful.cf_payment_id) : payment.transaction_id,
+      utr_number: successful.bank_reference || null,
+      payment_method: PAYMENT_METHOD_VALUES.includes(paymentGroup) ? paymentGroup : "upi",
+      gateway_status: "SUCCESS",
+      verified_amount: paidAmount,
+      verified_timestamp: now,
+      ...baseMeta,
+      "metadata.verified_via": "orders_api",
+      "metadata.verified_at": now,
+      "metadata.softpos_txn_status": "SUCCESS",
+      ...(successful.cf_payment_id != null && String(successful.cf_payment_id) !== String(payment.metadata?.cf_payment_id || "")
+        ? { "metadata.paid_cf_payment_id_differs": true }
+        : {}),
+      ...(amountVerified ? {} : { "metadata.amount_mismatch": true, "metadata.amount_mismatch_at": now }),
+      ...(wasRetired ? { "metadata.orphaned_after_method_switch": true } : {}),
+    }
+
+    // Claim the PENDING → SUCCESS transition atomically. A concurrent webhook
+    // and poll both land here; the unique one_successful_payment_per_booking
+    // index additionally forbids a second SUCCESS row for the booking.
+    let claimed = null
+    try {
+      claimed = await Payment.findOneAndUpdate(
+        { _id: payment._id, order_status: { $ne: "SUCCESS" } },
+        { $set: verifiedFields },
+        { new: true },
+      )
+    } catch (error) {
+      if (error?.code !== 11000) throw error
+      console.error(
+        `[CASHFREE_SOFTPOS] Booking ${payment.booking_id} already has a SUCCESS payment; ${payment.orderId} flagged for reconciliation (possible double payment).`,
+      )
+      await Payment.updateOne(
+        { _id: payment._id },
+        { $set: { ...baseMeta, "metadata.duplicate_paid_attempt": true, "metadata.verified_amount": paidAmount } },
+      )
+      return { state: "PAID", isPaid: false }
+    }
+    const current = claimed || (await Payment.findById(payment._id))
+
+    if (wasRetired) {
+      console.warn(
+        `[CASHFREE_SOFTPOS] ${payment.orderId} was PAID after being retired — flagged for manual reconciliation, booking not auto-advanced.`,
+      )
+      return { state: "PAID", isPaid: false }
+    }
+    if (!amountVerified || current?.metadata?.amount_mismatch === true) {
+      console.error(
+        `[CASHFREE_SOFTPOS] Amount mismatch on ${payment.orderId} (booking ${payment.booking_id}): order ₹${payment.orderAmount}, due ₹${booking?.amountDue}, paid ₹${paidAmount} — booking NOT advanced.`,
+      )
+      return { state: "PAID", isPaid: false }
+    }
+
+    // Idempotent: only the caller that flips payment_verified advances it.
+    // Re-running it after a crash between the two writes is what finishes
+    // a half-processed confirmation.
+    await advanceBookingAfterOnlinePayment(current, io)
+    return { state: "PAID", isPaid: true }
+  }
+
+  if (orderStatus === "ACTIVE") {
+    let txnStatus = null
+    try {
+      const payments = await softpos.fetchOrderPayments(payment.orderId)
+      const ours =
+        payments.find((item) => String(item?.cf_payment_id) === String(payment.metadata?.cf_payment_id)) ||
+        payments[0]
+      txnStatus = ours?.payment_status ? String(ours.payment_status).toUpperCase() : null
+    } catch (lookupError) {
+      console.error("[CASHFREE_SOFTPOS] Could not read order payments", {
+        orderId: payment.orderId,
+        message: sanitizeCashfreeError(lookupError),
+      })
+    }
+    await Payment.updateOne(
+      { _id: payment._id },
+      { $set: { ...baseMeta, ...(txnStatus ? { "metadata.softpos_txn_status": txnStatus } : {}) } },
+    )
+    if (txnStatus && softpos.DEAD_TRANSACTION_STATUSES.includes(txnStatus)) return { state: "FAILED", isPaid: false }
+    if (isExpired(payment)) return { state: "EXPIRED", isPaid: false }
+    return { state: "PENDING", isPaid: false }
+  }
+
+  // Cashfree says the order can no longer be paid, so a PENDING row may be
+  // closed locally without risk of hiding a payment.
+  const localStatus = orderStatus === "EXPIRED" ? "EXPIRED" : mapCashfreeStatus(orderStatus)
+  const closedStatus = localStatus === "PENDING" ? null : localStatus
+  await Payment.updateOne(
+    { _id: payment._id, order_status: "PENDING" },
+    { $set: { ...baseMeta, ...(closedStatus ? { order_status: closedStatus, gateway_status: orderStatus } : {}) } },
+  )
+  return closedStatus ? { state: "CLOSED", isPaid: false } : { state: "PENDING", isPaid: false }
+}
+
+const softposResponseData = (payment, extra = {}) => ({
+  order_id: payment.orderId,
+  cf_order_id: payment.cf_order_id || null,
+  cf_payment_id: payment.metadata?.cf_payment_id || null,
+  payment_id: payment._id,
+  payment_attempt: payment.payment_attempt,
+  amount: payment.orderAmount,
+  currency: "INR",
+  qr_code: payment.metadata?.qr_code || null,
+  expiry_time: payment.metadata?.expiry_time || null,
+  timeout_ms: payment.metadata?.softpos_timeout_ms || null,
+  cashfree_resource: CASHFREE_RESOURCE_SOFTPOS_QR,
+  status: "PENDING",
+  booking_id: payment.booking_id,
+  ...extra,
+})
+
+/**
+ * Mint one SOFTPOS_QR attempt. The local row is written FIRST with its
+ * deterministic order id, so a crash or network loss at any later step leaves
+ * a PENDING row that the next request will terminate at Cashfree before it
+ * may create attempt N+1 — never an untracked payable order.
+ */
+const createSoftposAttempt = async ({ booking, bookingId, amount, customerDetails, terminal }) => {
+  const latest = await Payment.findOne({
+    booking_id: bookingId,
+    "metadata.cashfree_resource": CASHFREE_RESOURCE_SOFTPOS_QR,
+  })
+    .sort({ payment_attempt: -1 })
+    .select("payment_attempt")
+    .lean()
+  const attempt = (Number(latest?.payment_attempt) || 0) + 1
+  const orderId = softpos.buildSoftposOrderId(bookingId, attempt)
+  const orderExpiryIso = buildExpiryIso(getQrExpiryMinutes())
+
+  const payment = await Payment.create({
+    orderId,
+    booking_id: bookingId,
+    dealer_id: booking.dealer_id?._id,
+    user_id: booking.user_id?._id,
+    orderAmount: Number(amount),
+    payment_type: "UPI_QR",
+    order_currency: "INR",
+    order_status: "PENDING",
+    payment_by: "user",
+    payment_attempt: attempt,
+    cf_terminal_id: String(terminal.cfTerminalId),
+    metadata: {
+      cashfree_resource: CASHFREE_RESOURCE_SOFTPOS_QR,
+      cf_terminal_id: String(terminal.cfTerminalId),
+      payment_attempt: attempt,
+      softpos_stage: "CREATING_ORDER",
+      // Provisional: replaced by the terminal transaction's own timeout.
+      expiry_time: orderExpiryIso,
+    },
+  })
+
+  try {
+    const order = await softpos.createSoftposOrder({
+      orderId,
+      amount,
+      bookingId,
+      bookingRef: booking.bookingId,
+      dealerId: booking.dealer_id?._id,
+      customerDetails,
+      expiryIso: orderExpiryIso,
+      terminal,
+    })
+    if (!order.cf_order_id) {
+      const missing = new Error("Cashfree did not return cf_order_id")
+      missing.code = "CASHFREE_ORDER_CREATE_FAILED"
+      throw missing
+    }
+    payment.cf_order_id = String(order.cf_order_id)
+    payment.metadata = {
+      ...payment.metadata,
+      cf_order_id: String(order.cf_order_id),
+      order_expiry_time: order.order_expiry_time || orderExpiryIso,
+      softpos_stage: "CREATING_TRANSACTION",
+    }
+    await payment.save()
+
+    const txn = await softpos.createTerminalQrTransaction({ cfOrderId: order.cf_order_id, orderId, terminal })
+    if (txn.paymentAmount != null && !amountMatches(amount, txn.paymentAmount)) {
+      const mismatch = new Error(
+        `Cashfree softPOS QR amount ₹${txn.paymentAmount} does not match booking amount ₹${amount}`,
+      )
+      mismatch.code = "CASHFREE_QR_UNAVAILABLE"
+      throw mismatch
+    }
+
+    // The QR lives for Cashfree's `timeout`, never past the order itself.
+    const orderExpiryMs = new Date(order.order_expiry_time || orderExpiryIso).getTime()
+    const txnExpiryMs = txn.timeoutMs ? Date.now() + txn.timeoutMs : orderExpiryMs
+    const expiresAt = new Date(Math.min(txnExpiryMs, orderExpiryMs))
+
+    payment.cf_payment_id = txn.cfPaymentId
+    payment.expires_at = expiresAt
+    payment.metadata = {
+      ...payment.metadata,
+      cf_payment_id: txn.cfPaymentId,
+      qr_code: txn.qrcode,
+      qr_source: "softpos_terminal_transaction",
+      qr_generated_at: new Date(),
+      softpos_timeout_ms: txn.timeoutMs,
+      softpos_payment_amount: txn.paymentAmount,
+      softpos_stage: "QR_ISSUED",
+      expiry_time: expiresAt.toISOString(),
+    }
+    await payment.save()
+    return payment
+  } catch (error) {
+    // Close whatever may exist remotely. Only once Cashfree confirms the
+    // order is not payable may the row leave PENDING; otherwise it stays
+    // PENDING and the next generate-qr retries the termination first.
+    try {
+      await terminateCashfreeOrder({ orderId })
+      await Payment.updateOne(
+        { _id: payment._id, order_status: "PENDING" },
+        {
+          $set: {
+            order_status: "FAILED",
+            gateway_status: "TERMINATED",
+            "metadata.failure_reason": error.message,
+            "metadata.failed_at": new Date(),
+          },
+        },
+      )
+    } catch (cleanupError) {
+      console.error("[CASHFREE_SOFTPOS] Could not close failed attempt; left PENDING for retry", {
+        orderId,
+        message: cleanupError.message,
+      })
+      if (cleanupError.code === "CASHFREE_ORDER_ALREADY_PAID") throw cleanupError
+    }
+    throw error
   }
 }
 
@@ -521,62 +608,69 @@ const generateUPIQRCode = async (req, res) => {
       })
     }
 
-    // Reuse before re-mint. The dealer app opens this screen on every mount;
-    // cancelling and recreating each time killed the QR the customer was
-    // already scanning. A live, unexpired PG order keeps its QR.
-    const reusable = await Payment.findOne({
-      booking_id: booking_id,
-      order_status: "PENDING",
-      "metadata.cashfree_resource": CASHFREE_RESOURCE_PG_ORDER,
-    })
+    const terminal = softpos.getSoftposTerminalConfig()
+    if (!terminal) {
+      console.error("[CASHFREE_SOFTPOS] CASHFREE_SOFTPOS_TERMINAL_ID is not configured")
+      return res.status(503).json({
+        success: false,
+        code: "SOFTPOS_TERMINAL_NOT_CONFIGURED",
+        message: "UPI QR payments are not configured yet. Please collect cash or try again later.",
+      })
+    }
 
-    if (reusable && !force && !isExpired(reusable) && reusable.metadata?.qr_code) {
-      let remoteOrderStatus = null
+    // Reuse before re-mint. The dealer app opens this screen on every mount;
+    // a live SOFTPOS_QR attempt is handed back as-is. `force` is honoured only
+    // once the current QR is verifiably dead — a still-payable QR is never
+    // replaced while the customer might be scanning it.
+    const pending = await Payment.findOne({ booking_id: booking_id, order_status: "PENDING" })
+    if (pending && pending.metadata?.cashfree_resource === CASHFREE_RESOURCE_SOFTPOS_QR) {
+      let verdict
       try {
-        const remote = await axios.get(
-          `${getCashfreeBaseUrl()}/orders/${encodeURIComponent(reusable.orderId)}`,
-          { headers: getCashfreeHeaders() },
-        )
-        remoteOrderStatus = remote.data?.order_status
-      } catch (lookupError) {
-        console.error("[CASHFREE] Could not re-verify reusable order", {
-          orderId: reusable.orderId,
-          message: sanitizeCashfreeError(lookupError),
-        })
+        verdict = await reconcileSoftposPayment(pending, req.app.get("io"))
+      } catch (verifyError) {
+        // 404: the attempt never reached Cashfree (crash before create-order
+        // landed). Nothing is payable, so the retire step below may close it.
+        // Anything else is unverifiable — never mint over it.
+        if (verifyError.response?.status !== 404) {
+          console.error("[CASHFREE_SOFTPOS] Could not verify the existing attempt", {
+            orderId: pending.orderId,
+            message: sanitizeCashfreeError(verifyError),
+          })
+          const blocked = new Error("Could not verify the current QR with Cashfree. Please check status again.")
+          blocked.code = "CASHFREE_CLEANUP_FAILED"
+          throw blocked
+        }
+        verdict = { state: "CLOSED", isPaid: false }
       }
 
-      // Only an order Cashfree still considers payable, for the amount the
-      // booking still owes, may be handed back.
-      if (remoteOrderStatus === "ACTIVE" && amountMatches(amount, reusable.orderAmount)) {
+      if (verdict.state === "PAID") {
+        const fresh = await Payment.findById(pending._id)
+        return res.status(200).json({
+          success: true,
+          message: verdict.isPaid ? "Payment already received" : "Payment received — pending reconciliation",
+          data: softposResponseData(fresh, { status: "SUCCESS", is_paid: verdict.isPaid, qr_code: null }),
+        })
+      }
+      if (
+        verdict.state === "PENDING" &&
+        pending.metadata?.qr_code &&
+        amountMatches(amount, pending.orderAmount)
+      ) {
+        if (force) {
+          console.log(`[CASHFREE_SOFTPOS] force ignored — ${pending.orderId} is still live`)
+        }
         return res.status(200).json({
           success: true,
           message: "Existing UPI QR reused",
-          data: {
-            order_id: reusable.orderId,
-            cf_order_id: reusable.cf_order_id || null,
-            payment_id: reusable._id,
-            amount: reusable.orderAmount,
-            currency: "INR",
-            qr_code: reusable.metadata.qr_code,
-            qr_code_raw: reusable.metadata.qr_code.startsWith(QR_DATA_URI_PREFIX)
-              ? reusable.metadata.qr_code.slice(QR_DATA_URI_PREFIX.length)
-              : reusable.metadata.qr_code,
-            expiry_time: reusable.metadata.expiry_time,
-            status: "PENDING",
-            reused: true,
-            booking_id: booking_id,
-          },
+          data: softposResponseData(pending, { reused: true }),
         })
       }
     }
 
-    // Cancel any still-pending session from an earlier QR (dealer switched
-    // method, the QR expired, or the dealer asked for a fresh one) so only
-    // the order below stays payable — never two live QR codes at once.
-    // Retiring the previous attempt is housekeeping, not the payment itself.
-    // A stale PAYMENT_LINK or a long-expired PG order must never keep the
-    // dealer from minting a fresh QR, and its gateway message must never be
-    // mistaken for a verdict on THIS request.
+    // Retire whatever PENDING attempt remains (expired/failed SOFTPOS_QR, or a
+    // historical PG_ORDER / PAYMENT_LINK row). terminateCashfreeOrder closes
+    // it at Cashfree first and refuses if Cashfree says it was PAID, so a
+    // successful payment is never cancelled here.
     try {
       await cancelPendingPaymentSessions(booking_id, "qr_regenerated")
     } catch (cleanupError) {
@@ -606,45 +700,24 @@ const generateUPIQRCode = async (req, res) => {
         "Customer",
     }
 
-    const created = await createDynamicUpiQrOrder({
+    const payment = await createSoftposAttempt({
       booking,
       bookingId: booking_id,
       amount,
       customerDetails,
+      terminal,
+    })
+    console.log("[CASHFREE_SOFTPOS] QR issued", {
+      paymentId: String(payment._id),
+      orderId: payment.orderId,
+      cf_order_id: payment.cf_order_id,
+      cf_payment_id: payment.cf_payment_id,
+      attempt: payment.payment_attempt,
+      expires_at: payment.metadata?.expiry_time,
     })
 
-    // Save payment record
-    const payment = new Payment({
-      cf_order_id: created.orderData.cf_order_id,
-      orderId: created.orderId,
-      booking_id: booking_id,
-      dealer_id: booking.dealer_id?._id,
-      user_id: booking.user_id?._id,
-      orderAmount: Number.parseFloat(amount),
-      payment_type: "UPI_QR",
-      order_currency: "INR",
-      order_status: "PENDING",
-      order_token: created.paymentSessionId,
-      payment_by: "user",
-      metadata: {
-        qr_generated_at: new Date(),
-        cashfree_resource: CASHFREE_RESOURCE_PG_ORDER,
-        payment_session_id: created.paymentSessionId,
-        cf_order_id: created.orderData.cf_order_id,
-        cf_payment_id: created.cfPaymentId,
-        expiry_time: created.orderData.order_expiry_time || created.expiryTime,
-        qr_source: created.qrSource,
-        // Stored so re-opening the screen shows the same QR instead of
-        // invalidating the one the customer is scanning.
-        qr_code: created.qrCodeDataUrl,
-      },
-    })
-
-    await payment.save()
-    console.log("Payment record saved:", payment._id)
-
-    // Update booking with payment reference — pricing fields are never
-    // touched here; they were fixed at booking creation (services/pricingEngine.js).
+    // Pricing fields are never touched here; they were fixed at booking
+    // creation (services/pricingEngine.js).
     await Booking.findByIdAndUpdate(booking_id, {
       $set: {
         billStatus: "pending",
@@ -654,23 +727,13 @@ const generateUPIQRCode = async (req, res) => {
     res.status(200).json({
       success: true,
       message: "UPI QR Code generated successfully",
-      data: {
-        order_id: created.orderId,
-        cf_order_id: created.orderData.cf_order_id || null,
-        payment_id: payment._id,
-        amount: Number.parseFloat(amount),
-        currency: "INR",
-        qr_code: created.qrCodeDataUrl,
-        qr_code_raw: created.qrCodeBase64,
-        expiry_time: created.orderData.order_expiry_time || created.expiryTime,
-        status: "PENDING",
+      data: softposResponseData(payment, {
         reused: false,
-        booking_id: booking_id,
         customer: {
           name: customerDetails.customer_name,
           phone: customerDetails.customer_phone,
         },
-      },
+      }),
     })
   } catch (error) {
     console.error("Generate UPI QR Error:", error.response?.data || error.message)
@@ -736,6 +799,36 @@ const checkPaymentStatus = async (req, res) => {
     const payment = await Payment.findOne({ orderId: order_id })
     if (!payment) {
       return res.status(404).json({ success: false, message: "Payment not found" })
+    }
+
+    if (isSoftposQr(payment)) {
+      const verdict = await reconcileSoftposPayment(payment, req.app.get("io"))
+      const fresh = await Payment.findById(payment._id)
+      // Same response shape the dealer app already understands; order_status
+      // is the attempt's state, not Cashfree's raw ACTIVE for a dead QR.
+      const appStatus = {
+        PAID: "PAID",
+        PENDING: "ACTIVE",
+        EXPIRED: "EXPIRED",
+        FAILED: "FAILED",
+        CLOSED: fresh?.order_status === "EXPIRED" ? "EXPIRED" : "CANCELLED",
+      }[verdict.state]
+      return res.status(200).json({
+        success: true,
+        message: "Payment status fetched successfully",
+        data: {
+          order_id: order_id,
+          order_status: appStatus,
+          local_status: fresh?.order_status || payment.order_status,
+          amount: payment.orderAmount,
+          payment_method: fresh?.payment_method || null,
+          transaction_id: fresh?.cf_payment_id || null,
+          cf_order_id: payment.cf_order_id || null,
+          expiry_time: payment.metadata?.expiry_time || null,
+          cashfree_resource: CASHFREE_RESOURCE_SOFTPOS_QR,
+          is_paid: verdict.isPaid,
+        },
+      })
     }
 
     const paymentLink = isPaymentLink(payment)
@@ -846,16 +939,58 @@ const cashfreeWebhook = async (req, res) => {
     const linkId = data?.link?.link_id || data?.payment_link?.link_id || null
     const orderId = data?.order?.order_id || null
     const resourceId = linkId || orderId
+    // softPOS failure / user-dropped events can omit data.order entirely and
+    // carry only the terminal transaction's cf_payment_id.
+    const softposPaymentId = !resourceId && data?.terminal_details && data?.payment?.cf_payment_id != null
+      ? String(data.payment.cf_payment_id)
+      : null
 
-    if (!data || !resourceId) {
+    if (!data || (!resourceId && !softposPaymentId)) {
       console.log("Invalid webhook payload")
       return res.status(400).json({ success: false, message: "Invalid payload" })
     }
 
-    const payment = await Payment.findOne({ orderId: resourceId })
+    const payment = resourceId
+      ? await Payment.findOne({ orderId: resourceId })
+      : await Payment.findOne({
+          "metadata.cashfree_resource": CASHFREE_RESOURCE_SOFTPOS_QR,
+          $or: [{ cf_payment_id: softposPaymentId }, { "metadata.cf_payment_id": softposPaymentId }],
+        })
     if (!payment) {
-      console.error(`Payment not found for Cashfree resource: ${resourceId}`)
+      console.error(`Payment not found for Cashfree resource: ${resourceId || `payment ${softposPaymentId}`}`)
       return res.status(404).json({ success: false, message: "Payment not found" })
+    }
+
+    if (isSoftposQr(payment)) {
+      const webhookTerminalId = data?.terminal_details?.cf_terminal_id
+      if (webhookTerminalId != null && payment.cf_terminal_id && String(webhookTerminalId) !== String(payment.cf_terminal_id)) {
+        console.warn(`[CASHFREE_SOFTPOS] Webhook terminal ${webhookTerminalId} does not match ${payment.orderId}'s terminal; ignored.`)
+        return res.status(200).json({ success: true, message: "Webhook ignored (terminal mismatch)" })
+      }
+      // The webhook only says "look at this order"; the verdict comes from
+      // Cashfree's Orders API inside reconcileSoftposPayment.
+      let verdict
+      try {
+        verdict = await reconcileSoftposPayment(payment, req.app.get("io"))
+      } catch (verifyError) {
+        console.error(`[CASHFREE_SOFTPOS] Webhook verification failed for ${payment.orderId}:`, sanitizeCashfreeError(verifyError))
+        return res.status(502).json({ success: false, message: "Payment verification failed" })
+      }
+      await Payment.updateOne(
+        { _id: payment._id },
+        { $set: { "metadata.webhook_received_at": new Date(), "metadata.webhook_event": eventType } },
+      )
+      console.log(`[CASHFREE_SOFTPOS] Webhook ${eventType} for ${payment.orderId} → ${verdict.state} (paid=${verdict.isPaid})`)
+      const io = req.app.get("io")
+      if (verdict.isPaid && io) {
+        io.emit("payment:success", {
+          order_id: payment.orderId,
+          booking_id: payment.booking_id,
+          amount: payment.orderAmount,
+          status: "SUCCESS",
+        })
+      }
+      return res.status(200).json({ success: true, message: "Webhook processed" })
     }
 
     // Do not trust webhook status fields. Verify the corresponding resource
@@ -1232,12 +1367,14 @@ module.exports = {
   getAllQRPayments,
   // Pure helpers, exported for test/bookingDynamicUpiQr.test.js only.
   __testing: {
-    extractDynamicQr,
+    reconcileSoftposPayment,
+    createSoftposAttempt,
     amountMatches,
     buildExpiryIso,
     isExpired,
     getQrExpiryMinutes,
     CASHFREE_RESOURCE_PG_ORDER,
     CASHFREE_RESOURCE_PAYMENT_LINK,
+    CASHFREE_RESOURCE_SOFTPOS_QR,
   },
 }

@@ -2,70 +2,11 @@ const assert = require("assert");
 const { __testing } = require("../controller/cashfreeQRController");
 
 const {
-  extractDynamicQr,
   amountMatches,
   buildExpiryIso,
   isExpired,
   getQrExpiryMinutes,
 } = __testing;
-
-// ── The regression this flow exists to prevent ──────────────────────────────
-// A QR built from a hosted-checkout URL opens Cashfree's web page instead of
-// paying from PhonePe/GPay. An http(s) value must never be treated as a QR.
-{
-  assert.strictEqual(
-    extractDynamicQr({ data: { url: "https://payments.cashfree.com/order/#session_abc" } }),
-    null,
-    "hosted checkout URL must not be accepted as a UPI QR",
-  );
-  assert.strictEqual(
-    extractDynamicQr({ data: { payload: { qrcode: "https://payments.cashfree.com/links/xyz" } } }),
-    null,
-    "a link URL in payload.qrcode must not be accepted as a UPI QR",
-  );
-  assert.strictEqual(
-    extractDynamicQr({ data: { payload: {} } }),
-    null,
-    "an empty payload yields no QR",
-  );
-  assert.strictEqual(extractDynamicQr({}), null, "a malformed response yields no QR");
-}
-
-// ── What Cashfree actually returns for upi/channel=qrcode ───────────────────
-{
-  const base64Png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
-  assert.deepStrictEqual(
-    extractDynamicQr({ data: { payload: { qrcode: base64Png } } }),
-    { kind: "image", value: base64Png },
-  );
-
-  // Pure base64 (no data URI prefix) is normalized downstream.
-  const rawBase64 = `iVBORw0KGgoAAAANSUhEUg${"A".repeat(120)}==`;
-  assert.deepStrictEqual(
-    extractDynamicQr({ data: { payload: { default_qr_code: rawBase64 } } }),
-    { kind: "image", value: rawBase64 },
-  );
-
-  // ...but a short alphanumeric token is not an image.
-  assert.strictEqual(
-    extractDynamicQr({ data: { payload: { qrcode: "PENDING" } } }),
-    null,
-    "a short status-ish string must not be mistaken for a base64 QR",
-  );
-
-  // A upi:// intent is a genuine dynamic UPI payload with the amount baked in.
-  const intent = "upi://pay?pa=bikedoctor@cashfree&pn=BikeDoctor&am=499.00&tr=BIKEDOC_1&cu=INR";
-  assert.deepStrictEqual(
-    extractDynamicQr({ data: { payload: { bqrdata: intent } } }),
-    { kind: "upi_intent", value: intent },
-  );
-
-  // A usable payload wins over a hosted URL sitting alongside it.
-  assert.deepStrictEqual(
-    extractDynamicQr({ data: { url: "https://payments.cashfree.com/x", payload: { qrcode: base64Png } } }),
-    { kind: "image", value: base64Png },
-  );
-}
 
 // ── Amount authority ────────────────────────────────────────────────────────
 {

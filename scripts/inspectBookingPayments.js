@@ -68,6 +68,10 @@ const minutesFromNow = (value) => {
           minutes_remaining: minutesFromNow(row.metadata?.expiry_time),
           qr_code_present: Boolean(row.metadata?.qr_code),
           qr_source: row.metadata?.qr_source || null,
+          payment_attempt: row.payment_attempt ?? null,
+          cf_order_id: row.cf_order_id || null,
+          cf_payment_id: row.cf_payment_id || null,
+          softpos_stage: row.metadata?.softpos_stage || null,
           createdAt: row.createdAt,
           updatedAt: row.updatedAt,
         },
@@ -84,19 +88,19 @@ const minutesFromNow = (value) => {
   if (rows.some((row) => row.order_status === "SUCCESS")) {
     console.log("  Booking is already paid — generate-qr must refuse.");
   } else if (!pending.length) {
-    console.log("  No PENDING row — generate-qr will mint a fresh PG_ORDER.");
+    console.log("  No PENDING row — generate-qr will mint a fresh SOFTPOS_QR attempt.");
   } else {
     for (const row of pending) {
       const resource = row.metadata?.cashfree_resource || "UNTAGGED";
       const remaining = minutesFromNow(row.metadata?.expiry_time);
-      if (resource !== "PG_ORDER") {
-        console.log(`  PENDING ${resource} ${row.orderId} — never reusable as a Dynamic QR; must be retired.`);
+      if (resource !== "SOFTPOS_QR") {
+        console.log(`  PENDING ${resource} ${row.orderId} — legacy, never reused; must be retired.`);
       } else if (remaining === null || remaining <= 0) {
-        console.log(`  PENDING PG_ORDER ${row.orderId} is expired — must be retired, then a fresh order minted.`);
+        console.log(`  PENDING SOFTPOS_QR ${row.orderId} (attempt ${row.payment_attempt}) is expired — generate-qr verifies, terminates it, then mints the next attempt.`);
       } else if (!row.metadata?.qr_code) {
-        console.log(`  PENDING PG_ORDER ${row.orderId} has no stored QR — must be retired.`);
+        console.log(`  PENDING SOFTPOS_QR ${row.orderId} has no stored QR (stage ${row.metadata?.softpos_stage}) — must be retired.`);
       } else {
-        console.log(`  PENDING PG_ORDER ${row.orderId} is live (${remaining} min left) — reuse it.`);
+        console.log(`  PENDING SOFTPOS_QR ${row.orderId} is live (${remaining} min left) — reuse it.`);
       }
     }
   }
