@@ -273,7 +273,10 @@ async function sendBookingNotification({ token, title, body, data, receiverId, r
   // Rich push: when the caller's data includes an image (e.g. campaign
   // notifications), attach it so Android renders Big Picture style and iOS
   // (via a notification service extension) can render an attachment.
-  const imageUrl = typeof data?.image === "string" && data.image ? data.image : undefined;
+  const imageUrl =
+    (typeof data?.pushImage === "string" && data.pushImage) ||
+    (typeof data?.image === "string" && data.image) ||
+    undefined;
 
   const message = {
     token,

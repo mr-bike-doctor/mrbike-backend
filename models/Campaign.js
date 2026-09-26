@@ -8,6 +8,9 @@ const campaignSchema = new mongoose.Schema(
     title: { type: String, required: true, trim: true },
     description: { type: String, required: true },
     image: { type: String, required: true },
+    // Portrait artwork used by the mobile in-app modal. Optional at schema
+    // level so campaigns created before this field was introduced keep working.
+    inAppImage: { type: String, default: "" },
     targetAudience: { type: String, enum: TARGET_AUDIENCES, default: "all" },
     pushNotification: { type: Boolean, default: false },
     inAppNotification: { type: Boolean, default: false },

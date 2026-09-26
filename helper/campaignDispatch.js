@@ -26,7 +26,16 @@ async function dispatchCampaign(campaign) {
       token,
       title: campaign.title,
       body: campaign.description,
-      data: { type: "campaign", campaignId: campaign._id.toString(), image: campaign.image },
+      data: {
+        type: "campaign",
+        campaignId: campaign._id.toString(),
+        // The notification row and app popup use portrait artwork. Old
+        // campaigns fall back to their original image until they are edited.
+        image: campaign.inAppImage || campaign.image,
+        inAppImage: campaign.inAppImage || campaign.image,
+        // FCM's expanded push notification keeps the landscape banner.
+        pushImage: campaign.image,
+      },
       receiverId: recipient._id,
       receiverType,
     });

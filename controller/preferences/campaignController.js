@@ -20,6 +20,7 @@ const { deleteS3Object } = require("../../utils/s3Upload");
 const { dispatchCampaign } = require("../../helper/campaignDispatch");
 
 const toBool = (v) => v === true || v === "true";
+const uploadedFile = (req, field) => req.files?.[field]?.[0] || (field === "image" ? req.file : null);
 
 const getCampaigns = async (req, res) => {
   try {
@@ -102,7 +103,13 @@ const createCampaign = async (req, res) => {
     if (!title || !title.trim()) return res.status(400).json({ success: false, message: "Title is required" });
     if (!description || !description.trim()) return res.status(400).json({ success: false, message: "Description is required" });
     if (!scheduleAt) return res.status(400).json({ success: false, message: "Schedule date & time is required" });
-    if (!req.file) return res.status(400).json({ success: false, message: "Campaign image is required" });
+    const bannerFile = uploadedFile(req, "image");
+    const inAppFile = uploadedFile(req, "inAppImage");
+    const wantsInApp = toBool(inAppNotification);
+    if (!bannerFile) return res.status(400).json({ success: false, message: "Campaign banner image is required" });
+    if (wantsInApp && !inAppFile) {
+      return res.status(400).json({ success: false, message: "In-app mobile image is required when in-app notification is enabled" });
+    }
     if (targetAudience && !TARGET_AUDIENCES.includes(targetAudience)) {
       return res.status(400).json({ success: false, message: `Invalid targetAudience. Allowed: ${TARGET_AUDIENCES.join(", ")}` });
     }
@@ -118,10 +125,11 @@ const createCampaign = async (req, res) => {
     const campaign = await Campaign.create({
       title: title.trim(),
       description,
-      image: req.file.location,
+      image: bannerFile.location,
+      inAppImage: inAppFile?.location || "",
       targetAudience: targetAudience || "all",
       pushNotification: toBool(pushNotification),
-      inAppNotification: toBool(inAppNotification),
+      inAppNotification: wantsInApp,
       scheduleAt: scheduleDate,
       status: status || "draft",
     });
@@ -165,10 +173,22 @@ const updateCampaign = async (req, res) => {
       campaign.scheduleAt = scheduleDate;
     }
 
-    if (req.file) {
+    const bannerFile = uploadedFile(req, "image");
+    const inAppFile = uploadedFile(req, "inAppImage");
+    if (campaign.inAppNotification && !inAppFile && !campaign.inAppImage) {
+      return res.status(400).json({ success: false, message: "In-app mobile image is required when in-app notification is enabled" });
+    }
+
+    if (bannerFile) {
       const oldImage = campaign.image;
-      campaign.image = req.file.location;
+      campaign.image = bannerFile.location;
       deleteS3Object(oldImage);
+    }
+
+    if (inAppFile) {
+      const oldInAppImage = campaign.inAppImage;
+      campaign.inAppImage = inAppFile.location;
+      deleteS3Object(oldInAppImage);
     }
 
     await campaign.save();
