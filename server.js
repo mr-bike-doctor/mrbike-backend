@@ -280,6 +280,7 @@ const { Server } = require("socket.io");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 const validateProductionEnv = require("./config/validateProductionEnv");
 validateProductionEnv();
+require("./config/reportSoftposConfig")();
 
 const apiRouter = require("./routes/index");
 const db = require("./models/index");
