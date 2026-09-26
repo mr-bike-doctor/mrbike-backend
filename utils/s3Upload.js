@@ -31,22 +31,34 @@ const DEFAULT_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
  */
 function createS3Upload(folder, options = {}) {
   const allowed = options.allowedExtensions || DEFAULT_ALLOWED_EXTENSIONS;
+  const allowedMimeTypes = options.allowedMimeTypes || null;
   const maxFileSizeBytes = options.maxFileSizeBytes || DEFAULT_MAX_FILE_SIZE_BYTES;
 
+  const storageOptions = {
+    s3,
+    bucket: BUCKET,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    key: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      const filename = `${file.fieldname}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+      cb(null, `${folder}/${filename}`);
+    },
+  };
+
+  // Banner object keys are content-hashed by time/randomness and never reused,
+  // so immutable caching cannot make an edited banner stale. Keep this opt-in:
+  // documents and customer uploads must not inherit public cache semantics.
+  if (options.cacheControl) {
+    storageOptions.cacheControl = (_req, _file, cb) => cb(null, options.cacheControl);
+  }
+
   return multer({
-    storage: multerS3({
-      s3,
-      bucket: BUCKET,
-      contentType: multerS3.AUTO_CONTENT_TYPE,
-      key: (req, file, cb) => {
-        const ext = path.extname(file.originalname).toLowerCase();
-        const filename = `${file.fieldname}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-        cb(null, `${folder}/${filename}`);
-      },
-    }),
+    storage: multerS3(storageOptions),
     fileFilter: (req, file, cb) => {
       const ext = path.extname(file.originalname).toLowerCase();
-      if (allowed.includes(ext)) cb(null, true);
+      const extensionAllowed = allowed.includes(ext);
+      const mimeAllowed = !allowedMimeTypes || allowedMimeTypes.includes(file.mimetype);
+      if (extensionAllowed && mimeAllowed) cb(null, true);
       else cb(new Error(`Invalid file type. Allowed: ${allowed.join(", ")}`), false);
     },
     limits: {
@@ -54,6 +66,14 @@ function createS3Upload(folder, options = {}) {
     },
   });
 }
+
+const BANNER_MAX_FILE_SIZE_BYTES = 800 * 1024;
+const BANNER_UPLOAD_OPTIONS = {
+  allowedExtensions: [".jpg", ".jpeg", ".png", ".webp"],
+  allowedMimeTypes: ["image/jpeg", "image/png", "image/webp"],
+  maxFileSizeBytes: BANNER_MAX_FILE_SIZE_BYTES,
+  cacheControl: "public, max-age=31536000, immutable",
+};
 
 /**
  * Deletes a previously uploaded S3 object given its stored `.location` URL
@@ -73,4 +93,11 @@ async function deleteS3Object(location) {
   }
 }
 
-module.exports = { createS3Upload, deleteS3Object, DEFAULT_ALLOWED_EXTENSIONS, DEFAULT_MAX_FILE_SIZE_BYTES };
+module.exports = {
+  createS3Upload,
+  deleteS3Object,
+  DEFAULT_ALLOWED_EXTENSIONS,
+  DEFAULT_MAX_FILE_SIZE_BYTES,
+  BANNER_MAX_FILE_SIZE_BYTES,
+  BANNER_UPLOAD_OPTIONS,
+};

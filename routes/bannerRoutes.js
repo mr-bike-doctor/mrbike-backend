@@ -3,10 +3,10 @@ var path = require("path")
 const { verifyToken } = require("../helper/verifyAuth")
 const { requireAdmin } = require("../middlewares/requireAdmin")
 var { addbanner, bannerlist, deletebanner, editbanner } = require("../controller/banner")
-const { createS3Upload } = require("../utils/s3Upload")
+const { createS3Upload, BANNER_UPLOAD_OPTIONS } = require("../utils/s3Upload")
 const router = express.Router()
 
-const upload = createS3Upload("banners")
+const upload = createS3Upload("banners", BANNER_UPLOAD_OPTIONS)
 
 /* POST users listing. */
 router.post("/addbanner", requireAdmin, upload.single("images"), addbanner)

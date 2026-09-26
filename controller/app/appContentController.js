@@ -2,14 +2,13 @@
  * Public App Content Controller
  *
  * Unauthenticated reads of published Preferences content for the customer
- * app. The Home banner read also performs an idempotent compatibility sync
- * for records created through the retained legacy `/bannerList` admin flow.
+ * app. Legacy `/bannerList` writes are mirrored into AppBanner by their write
+ * handlers, keeping this public read path fast and side-effect free.
  */
 
 const LegalDocument = require("../../models/LegalDocument");
 const AppSettings = require("../../models/AppSettings");
 const AppBanner = require("../../models/AppBanner");
-const { syncAllLegacyBanners } = require("../../services/legacyBannerSyncService");
 const Faq = require("../../models/Faq");
 const { LEGAL_DOC_TYPES } = LegalDocument;
 const { BANNER_TYPES } = AppBanner;
@@ -73,10 +72,10 @@ const getPublicAppBanners = async (req, res) => {
     if (!isValidBannerType(bannerType)) {
       return res.status(400).json({ success: false, message: `Invalid bannerType. Allowed: ${BANNER_TYPES.join(", ")}` });
     }
-    // `/bannerList` is retained for backward compatibility. Keep its existing
-    // records mirrored into AppBanner so every app client still reads from the
-    // single AppBanner source of truth.
-    if (bannerType === "home") await syncAllLegacyBanners();
+    // Legacy create/update/delete handlers mirror their individual record into
+    // AppBanner. Do not bulk-sync the entire collection on this read path: it
+    // made every Home visit wait for a database write before banners could be
+    // returned. Older deployments can use migrateLegacyHomeBanners.js once.
     const now = new Date();
     // scheduleEnd is compared against the start of today rather than the
     // exact instant `now`: banners written before the end-of-day fix have
