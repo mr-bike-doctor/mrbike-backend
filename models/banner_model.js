@@ -70,22 +70,24 @@ const bannerSchema = new mongoose.Schema({
   timestamps: true,
 });
 
-bannerSchema.plugin(AutoIncrement, { id: "banner_seq", inc_field: "id" });
+// parallel_hooks: false makes the plugin finish assigning `id` before the
+// bannerId hook below runs, so that hook can build the ID from it.
+bannerSchema.plugin(AutoIncrement, {
+  id: "banner_seq",
+  inc_field: "id",
+  parallel_hooks: false,
+});
 
-// Pre-save hook to generate readable bannerId (6 characters)
-bannerSchema.pre("save", async function (next) {
+// Pre-save hook to generate readable bannerId, e.g. BAN001, BAN002.
+// Built from the auto-increment `id` (an atomic counter in the counters
+// collection), never from a document count: the counter only moves forward,
+// so deleting banners can never cause a later bannerId to collide with an
+// existing one.
+bannerSchema.pre("save", function (next) {
   if (!this.isNew || this.bannerId) return next();
-
-  try {
-    // Generate bannerId in format: BAN + 3-digit sequence
-    // Example: BAN001, BAN002, etc.
-    const count = await mongoose.model("Banner").countDocuments();
-    const sequence = String(count + 1).padStart(3, "0");
-    this.bannerId = `BAN${sequence}`;
-    next();
-  } catch (error) {
-    next(error);
-  }
+  if (!this.id) return next(new Error("Banner sequence id was not assigned"));
+  this.bannerId = `BAN${String(this.id).padStart(3, "0")}`;
+  next();
 });
 
 module.exports = mongoose.model("Banner", bannerSchema);
