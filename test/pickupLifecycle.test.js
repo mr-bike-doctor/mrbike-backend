@@ -19,6 +19,7 @@ const {
   pickupOtpMatches,
   pickupOtpIsExpired,
   canVerifyPickupOtp,
+  canRegeneratePickupOtp,
   canCompleteBikePickup,
   pickupLocationSocketPayload,
 } = require("../services/pickupLifecycle");
@@ -158,6 +159,16 @@ async function run() {
   assert.strictEqual(
     canVerifyPickupOtp({ pickupStatus: PICKUP_STATUSES.ARRIVED, pickupOtp: 4321, pickupOtpVerifiedAt: null }, "4321"),
     true
+  );
+  assert.strictEqual(
+    canRegeneratePickupOtp({ pickupStatus: PICKUP_STATUSES.ARRIVED, pickupOtpVerifiedAt: null }),
+    true,
+    "an unverified arrived pickup can regenerate its OTP"
+  );
+  assert.strictEqual(
+    canRegeneratePickupOtp({ pickupStatus: PICKUP_STATUSES.PICKUP_OTP_VERIFIED, pickupOtpVerifiedAt: new Date() }),
+    false,
+    "a verified pickup cannot regenerate its OTP"
   );
   assert.strictEqual(
     canVerifyPickupOtp({

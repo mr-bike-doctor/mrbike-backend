@@ -15,6 +15,7 @@ const {
   shouldRecordNearby,
   pickupOtpMatches,
   pickupOtpIsExpired,
+  canRegeneratePickupOtp,
   canCompleteBikePickup,
   pickupLocationSocketPayload,
 } = require("../services/pickupLifecycle");
@@ -391,6 +392,60 @@ async function getPickupOtpForCustomer(req, res) {
   }
 }
 
+async function regeneratePickupOtp(req, res) {
+  try {
+    const bookingDoc = await loadPickupBooking(req.params.bookingId);
+    if (!pickupGuard(res, bookingDoc)) return;
+    if (!canRegeneratePickupOtp(bookingDoc)) {
+      return res.status(409).json({
+        success: false,
+        message: "Pickup OTP can be resent only after arrival and before verification",
+      });
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + PICKUP_OTP_TTL_MS);
+    const nextOtp = pickupOtp();
+    const updated = await Booking.findOneAndUpdate(
+      {
+        _id: bookingDoc._id,
+        dealer_id: req.auth.id,
+        pickupStatus: PICKUP_STATUSES.ARRIVED,
+        pickupOtpVerifiedAt: null,
+      },
+      {
+        $set: {
+          pickupOtp: nextOtp,
+          pickupOtpExpiresAt: expiresAt,
+        },
+      },
+      { new: true }
+    );
+    if (!updated) {
+      return res.status(409).json({
+        success: false,
+        message: "Pickup OTP was already verified or booking state changed",
+      });
+    }
+
+    await notifyCustomer(
+      req,
+      updated,
+      "otp-regenerated",
+      "New Pickup OTP",
+      "A new pickup OTP is ready. Open the booking to view it."
+    );
+    return res.status(200).json({
+      success: true,
+      message: "A new pickup OTP is now visible in the customer app",
+      data: { bookingId: updated._id, pickupStatus: updated.pickupStatus, expiresAt },
+    });
+  } catch (error) {
+    console.error("regeneratePickupOtp error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+}
+
 async function completeBikePickup(req, res) {
   try {
     const bookingDoc = await loadPickupBooking(req.params.bookingId);
@@ -444,6 +499,7 @@ module.exports = {
   updatePickupLocation,
   markArrived,
   getPickupOtpForCustomer,
+  regeneratePickupOtp,
   verifyPickupOtp,
   completeBikePickup,
 };

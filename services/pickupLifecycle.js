@@ -113,6 +113,13 @@ function canVerifyPickupOtp(booking, incomingOtp) {
   );
 }
 
+function canRegeneratePickupOtp(booking) {
+  return Boolean(
+    booking?.pickupStatus === PICKUP_STATUSES.ARRIVED &&
+      booking.pickupOtpVerifiedAt == null
+  );
+}
+
 function canCompleteBikePickup(booking) {
   return Boolean(
     booking?.pickupStatus === PICKUP_STATUSES.PICKUP_OTP_VERIFIED &&
@@ -150,6 +157,7 @@ module.exports = {
   pickupOtpMatches,
   pickupOtpIsExpired,
   canVerifyPickupOtp,
+  canRegeneratePickupOtp,
   canCompleteBikePickup,
   pickupLocationSocketPayload,
 };
