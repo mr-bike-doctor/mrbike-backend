@@ -18,6 +18,11 @@ const campaignSchema = new mongoose.Schema(
     status: { type: String, enum: CAMPAIGN_STATUSES, default: "draft" },
     analytics: {
       sent: { type: Number, default: 0 },
+      // Push outcomes as reported by FCM at send time: accepted by FCM,
+      // rejected (invalid/expired token, etc.), and recipients with no token.
+      pushSent: { type: Number, default: 0 },
+      pushFailed: { type: Number, default: 0 },
+      noDeviceToken: { type: Number, default: 0 },
       delivered: { type: Number, default: 0 },
       opened: { type: Number, default: 0 },
       clicked: { type: Number, default: 0 },

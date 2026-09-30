@@ -1,5 +1,5 @@
 const Campaign = require("../models/Campaign");
-const { dispatchCampaign } = require("./campaignDispatch");
+const { dispatchCampaign, recordDispatch } = require("./campaignDispatch");
 
 const POLL_INTERVAL_MS = 60 * 1000; // 1 minute
 
@@ -22,11 +22,14 @@ async function runScheduledCampaigns() {
 
       if (campaign) {
         try {
-          const sentCount = await dispatchCampaign(campaign);
+          const result = await dispatchCampaign(campaign);
           campaign.status = "completed";
-          campaign.analytics.sent += sentCount;
+          recordDispatch(campaign, result);
           await campaign.save();
-          console.log(`[CAMPAIGN-SCHEDULER] Sent campaign "${campaign.title}" to ${sentCount} recipient(s)`);
+          console.log(
+            `[CAMPAIGN-SCHEDULER] Sent campaign "${campaign.title}" to ${result.recipients} recipient(s)` +
+              ` | push sent=${result.pushSent} failed=${result.pushFailed} noToken=${result.noDeviceToken}`
+          );
         } catch (err) {
           console.error(`[CAMPAIGN-SCHEDULER] Dispatch failed for ${campaign._id}:`, err.message);
         }

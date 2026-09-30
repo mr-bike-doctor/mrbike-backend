@@ -132,72 +132,22 @@
 const admin = require("./firebase/firebaseAdmin"); // Firebase Admin SDK
 const NotificationModel = require("../models/Notification"); // Adjust the path as needed
 
-// Send and store notification
-async function Notification(deviceToken, messageBody, dealer_id) {
-  console.log(deviceToken,dealer_id,messageBody,"======>three")
-  if (!deviceToken || deviceToken === "" || deviceToken === undefined) {
-    console.log("=== not getting device token ===========>");
-    return;
-  }
-
-  const title = "Mr. Bike Doctor App";
-  const body = messageBody;
-
-  const message = {
-    token: deviceToken,
-    notification: {
-      title,
-      body,
-    },
-    data: {
-      title,
-      body,
-      dealer_id: dealer_id.toString(),
-      sound: "notifi",
-      collapseKey: "com.bikedoctor_provider",
-    },
-    android: {
-      priority: "high",
-      notification: {
-        sound: "notifi",
-        channel_id: "Provider.channel",
-      },
-    },
-  };
-
-  // Step 1: Save notification as 'pending'
-  const notificationEntry = new NotificationModel({
-    title,
-    body,
-    data: {
-      dealer_id: dealer_id.toString(),
-    },
-    receiverId: dealer_id,
-    receiverType: "dealer",
-    status: "pending",
+// Legacy plain-text booking status push. Every remaining caller
+// (controller/booking.js) addresses a CUSTOMER, even though the third
+// argument was historically named dealer_id — it used to be stored with
+// receiverType "dealer" and sent on the provider app's channel, so it never
+// reached the user's in-app list and targeted a channel the user app lacks.
+// It now goes through sendBookingNotification like every other push.
+async function Notification(deviceToken, messageBody, user_id) {
+  if (!user_id) return;
+  return sendBookingNotification({
+    token: deviceToken || null,
+    title: "Mr. Bike Doctor App",
+    body: messageBody,
+    data: { type: "booking_update" },
+    receiverId: user_id,
+    receiverType: "user",
   });
-
-  try {
-    const savedNotification = await notificationEntry.save();
-
-    // Step 2: Send FCM notification
-    const response = await admin.messaging().send(message);
-    console.log("Successfully sent message:", response);
-
-    // Step 3: Update status to 'sent'
-    savedNotification.status = "sent";
-    savedNotification.sentAt = new Date();
-    await savedNotification.save();
-    console.log("Notification saved to DB with status 'sent'");
-  } catch (error) {
-    console.error("Notification error:", error);
-
-    // Update DB entry if notification was saved but FCM failed
-    if (notificationEntry._id) {
-      notificationEntry.status = "failed";
-      await notificationEntry.save();
-    }
-  }
 }
 
 // Defence-in-depth gate for NEW-BOOKING pushes addressed to a dealer.
@@ -237,11 +187,55 @@ async function isNewBookingPushAllowed({ data, receiverId, receiverType }) {
   }
 }
 
+// Android channels and raw sounds are per app, and a push naming a channel the
+// app never created is silently re-routed by the FCM SDK. These ids must match
+// what each app creates natively at startup:
+//   provider app (MainApplication.kt): "booking_alerts" (order.mp3, HIGH) and
+//     "general_notifications" (default sound)
+//   user app (index.js): "com.mrbikeuser" (default sound, HIGH)
+const NEW_BOOKING_TYPES = new Set(["new_booking", "booking"]);
+function resolveAndroidChannel(receiverType, data) {
+  if (receiverType === "dealer") {
+    return NEW_BOOKING_TYPES.has(String(data?.type || "").toLowerCase())
+      ? { channelId: "booking_alerts", sound: "order" }
+      : { channelId: "general_notifications", sound: "default", defaultSound: true };
+  }
+  return { channelId: "com.mrbikeuser", sound: "default", defaultSound: true };
+}
+
+// FCM error codes meaning the token will never work again (app uninstalled,
+// data cleared, token rotated). Keeping such a token means every future push
+// fails the same way, so it is cleared; the app re-registers a fresh one on
+// its next start (customers/register-token, dealer/register-token).
+const DEAD_TOKEN_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+]);
+async function clearDeadToken(receiverType, receiverId, token) {
+  if (!receiverId) return;
+  try {
+    // Required lazily for the same cycle reason as isNewBookingPushAllowed.
+    const Model =
+      receiverType === "dealer"
+        ? require("../models/dealerModel")
+        : require("../models/customer_model");
+    // Only clear the fields still holding THIS token — a fresh token written
+    // by a concurrent register-token call must survive.
+    await Model.updateOne({ _id: receiverId, device_token: token }, { $set: { device_token: null } });
+    await Model.updateOne({ _id: receiverId, ftoken: token }, { $set: { ftoken: null } });
+    console.log(`[FCM-TOKEN-CLEARED] ${receiverType}:${receiverId} | token no longer registered`);
+  } catch (err) {
+    console.error(`[FCM-TOKEN-CLEAR-FAILED] ${receiverType}:${receiverId} | ${err.message}`);
+  }
+}
+
 // Structured booking notification — title, body, data, receiverType all explicit.
+// Resolves to the delivery outcome ("sent", "failed", "invalid_token",
+// "no_token", "blocked", "save_failed") so bulk senders can report counts.
 // FCM data payload requires all values to be strings.
 async function sendBookingNotification({ token, title, body, data, receiverId, receiverType, bookingId }) {
   if (!(await isNewBookingPushAllowed({ data, receiverId, receiverType }))) {
-    return;
+    return "blocked";
   }
 
   const notificationEntry = new NotificationModel({
@@ -258,16 +252,18 @@ async function sendBookingNotification({ token, title, body, data, receiverId, r
     await notificationEntry.save();
   } catch (err) {
     console.error(`[NOTIFICATION-SAVE-FAILED] ${title} → ${receiverType}:${receiverId} | ${err.message}`);
-    return;
+    return "save_failed";
   }
 
   if (!token) {
     console.log(`[FCM-SKIPPED] ${title} → ${receiverType}:${receiverId} | no device token`);
-    return;
+    return "no_token";
   }
 
   const fcmData = Object.fromEntries(
-    Object.entries(data).map(([k, v]) => [k, String(v)])
+    Object.entries(data || {})
+      .filter(([, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => [k, String(v)])
   );
 
   // Rich push: when the caller's data includes an image (e.g. campaign
@@ -278,6 +274,8 @@ async function sendBookingNotification({ token, title, body, data, receiverId, r
     (typeof data?.image === "string" && data.image) ||
     undefined;
 
+  const androidChannel = resolveAndroidChannel(receiverType, data);
+
   const message = {
     token,
     notification: { title, body, ...(imageUrl && { imageUrl }) },
@@ -285,8 +283,7 @@ async function sendBookingNotification({ token, title, body, data, receiverId, r
     android: {
       priority: "high",
       notification: {
-        sound: "notifi",
-        channel_id: "Provider.channel",
+        ...androidChannel,
         ...(imageUrl && { imageUrl }),
       },
     },
@@ -304,10 +301,16 @@ async function sendBookingNotification({ token, title, body, data, receiverId, r
     notificationEntry.status = "sent";
     notificationEntry.sentAt = new Date();
     await notificationEntry.save();
+    return "sent";
   } catch (err) {
-    console.error(`[FCM-FAILED] ${title} → ${receiverType}:${receiverId} | ${err.message}`);
+    console.error(`[FCM-FAILED] ${title} → ${receiverType}:${receiverId} | ${err.code || ""} ${err.message}`);
     notificationEntry.status = "failed";
     await notificationEntry.save().catch(() => {});
+    if (DEAD_TOKEN_CODES.has(err.code)) {
+      await clearDeadToken(receiverType, receiverId, token);
+      return "invalid_token";
+    }
+    return "failed";
   }
 }
 

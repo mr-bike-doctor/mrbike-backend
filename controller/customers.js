@@ -1259,6 +1259,39 @@ async function getMrBikeMoneyTransactions(req, res) {
   }
 }
 
+// Keeps the customer's FCM registration current. The app sends a token at
+// login, but FCM rotates tokens (reinstall-restore, data clear, periodic
+// refresh) without a new login — a stale token makes every push, campaigns
+// included, fail with "Requested entity was not found" while the app is
+// backgrounded or killed. The app calls this on start and on onTokenRefresh.
+async function registerCustomerToken(req, res) {
+  try {
+    const user_id = req.user_id;
+    if (!user_id) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { device_token } = req.body;
+    if (!device_token || typeof device_token !== "string" || device_token.trim() === "") {
+      return res.status(400).json({ success: false, message: "device_token is required" });
+    }
+
+    const customer = await customers.findByIdAndUpdate(
+      user_id,
+      { device_token: device_token.trim() },
+      { new: true, select: "_id" }
+    );
+    if (!customer) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    return res.status(200).json({ success: true, message: "Device token registered successfully" });
+  } catch (error) {
+    console.error("registerCustomerToken error:", error);
+    return res.status(500).json({ success: false, message: "Internal server error" });
+  }
+}
+
 module.exports = {
   addProfile,
   customerlist,
@@ -1278,4 +1311,5 @@ module.exports = {
   getReferralSummary,
   getReferralTransactions,
   getMrBikeMoneyTransactions,
+  registerCustomerToken,
 };

@@ -17,7 +17,7 @@ const mongoose = require("mongoose");
 const Campaign = require("../../models/Campaign");
 const { TARGET_AUDIENCES, CAMPAIGN_STATUSES } = Campaign;
 const { deleteS3Object } = require("../../utils/s3Upload");
-const { dispatchCampaign } = require("../../helper/campaignDispatch");
+const { dispatchCampaign, recordDispatch } = require("../../helper/campaignDispatch");
 
 const toBool = (v) => v === true || v === "true";
 const uploadedFile = (req, field) => req.files?.[field]?.[0] || (field === "image" ? req.file : null);
@@ -88,7 +88,7 @@ const getCampaignAnalytics = async (req, res) => {
     if (!campaign) return res.status(404).json({ success: false, message: "Campaign not found" });
     return res.status(200).json({
       success: true,
-      data: campaign.analytics || { sent: 0, delivered: 0, opened: 0, clicked: 0, conversionRate: 0 },
+      data: campaign.analytics || { sent: 0, pushSent: 0, pushFailed: 0, noDeviceToken: 0, delivered: 0, opened: 0, clicked: 0, conversionRate: 0 },
     });
   } catch (error) {
     console.error("getCampaignAnalytics error:", error);
@@ -250,15 +250,19 @@ const sendCampaignNow = async (req, res) => {
     const campaign = await Campaign.findOne({ _id: id, isDeleted: false });
     if (!campaign) return res.status(404).json({ success: false, message: "Campaign not found" });
 
-    const sentCount = await dispatchCampaign(campaign);
+    const result = await dispatchCampaign(campaign);
     campaign.status = "completed";
-    campaign.analytics.sent += sentCount;
+    recordDispatch(campaign, result);
     await campaign.save();
 
+    const pushSummary = campaign.pushNotification
+      ? ` · Push sent: ${result.pushSent}, failed: ${result.pushFailed}, no device token: ${result.noDeviceToken}`
+      : "";
     return res.status(200).json({
       success: true,
-      message: `Campaign sent to ${sentCount} recipient(s)`,
+      message: `Campaign sent to ${result.recipients} recipient(s)${pushSummary}`,
       data: campaign,
+      dispatch: result,
     });
   } catch (error) {
     console.error("sendCampaignNow error:", error);
