@@ -523,5 +523,6 @@ module.exports = {
     getOrCreateInvoice,
     backfillBikeRegistration,
     refreshBillServiceLines,
+    buildServiceLineItems,
     buildInvoiceResponse,
 };
