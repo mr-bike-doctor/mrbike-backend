@@ -606,9 +606,6 @@ const GetwalletInfo = async (req, res) => {
   }
 };
 
-// Payout related in cashfree method
-
-
 async function calculateDealerAmount(dealer, orderAmount) {
   // Commission math delegated to the pricing engine — single source of
   // truth for all monetary calculations (services/pricingEngine.js).
@@ -730,47 +727,6 @@ const WalletAdd = async (req, res) => {
   }
 };
 
-
-function prepareTransferRequest(dealerId, orderAmount) {
-  const requestData = {
-    transfer_from: 'VENDOR',
-    transfer_type: 'ADJUSTMENT',
-    transfer_amount: orderAmount,
-    remark: 'Testing',
-    tags: {
-      size: 1,
-      product: 'SHRT'
-    }
-  };
-
-  const apiUrl = `https://api.cashfree.com/pg/easy-split/vendors/${dealerId}/transfer`;
-
-  const timestamp = Date.now();
-  const tokenData = `${process.env.CASHFREE_APP_ID}:${timestamp}:${process.env.CASHFREE_SECRET_KEY}`;
-  const token = crypto.createHmac('sha256', process.env.CASHFREE_SECRET_KEY).update(tokenData).digest('base64');
-
-  const headers = {
-    'accept': 'application/json',
-    'content-type': 'application/json',
-    'x-api-version': '2023-08-01',
-    'X-Client-Id': process.env.CASHFREE_APP_ID,
-    'X-Client-Secret': process.env.CASHFREE_SECRET_KEY,
-    'X-Timestamp': timestamp
-  };
-
-  return { requestData, apiUrl, headers };
-}
-
-const tranfer = async (req, res) => {
-  try {
-    const { dealerId, orderAmount } = req.body;
-    const { requestData, apiUrl, headers } = prepareTransferRequest(dealerId, orderAmount);
-    return res.status(200).json({ success: true, requestData, apiUrl, headers, message: "ok" });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ success: false, message: 'Internal server error' });
-  }
-};
 
 async function addAmount(req, res) {
   try {
@@ -1496,7 +1452,7 @@ const createDeposit = async (req, res) => {
 
     const { dealer_id, amount, note } = req.body;
 
-    // Dealer-authenticated callers should use the existing Cashfree wallet
+    // Dealer-authenticated callers should use the PayU wallet
     // top-up flow instead of the admin/manual deposit flow. This keeps the
     // production gateway path in one place and avoids duplicating wallet
     // credit logic in the frontend.
@@ -1625,7 +1581,6 @@ module.exports = {
   GetwalletInfo,
   WalletAdd,
   addAmount,
-  tranfer,
   dealerWithInRange2,
   getShopDetails,
   addDealerShopDetails,

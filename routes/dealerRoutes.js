@@ -26,7 +26,6 @@ var {
   GetwalletInfo,
   WalletAdd,
   addAmount,
-  tranfer,
   dealerWithInRange2,
   getShopDetails,
   addDealerShopDetails,
@@ -558,9 +557,7 @@ router.post("/update_status", requireAdmin, editDealerStatus)
 
 router.post("/processTransaction/:id", requireAdmin, WalletAdd)
 
-//  Payout of cashfree ---- NOT IN Use
 router.post("/AddAmout/:id", requireAdmin, addAmount)
-router.post("/prepare-transfer", requireAdmin, tranfer)
 router.get("/getShopDetails/:id", getShopDetails)
 
 router.post("/add-shop-details", upload.fields([{ name: "shopImages", maxCount: 5 }]), addDealerShopDetails)

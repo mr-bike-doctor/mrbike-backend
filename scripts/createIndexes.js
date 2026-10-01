@@ -93,17 +93,6 @@ async function createIndexes() {
     await mongoose.connection.db.collection('vendors').createIndex({ online: 1, latitude: 1, longitude: 1 })
     console.log('✓ Vendor indexes created')
 
-    // Cashfree webhook idempotency and retention indexes. The unique eventId
-    // index is the cross-process concurrency guard for duplicate deliveries.
-    await mongoose.connection.db.collection('cashfreewebhookevents').createIndex(
-      { eventId: 1 },
-      { unique: true, name: 'cashfree_webhook_event_id_unique' },
-    )
-    await mongoose.connection.db.collection('cashfreewebhookevents').createIndex(
-      { expiresAt: 1 },
-      { expireAfterSeconds: 0, name: 'cashfree_webhook_event_expiry_ttl' },
-    )
-    console.log('✓ Cashfree webhook security indexes created')
 
     await mongoose.connection.db.collection('payments').createIndex(
       { booking_id: 1 },

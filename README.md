@@ -49,9 +49,11 @@ FIREBASE_PRIVATE_KEY="your_private_key"
 FIREBASE_CLIENT_EMAIL="your_client_email"
 # ... other FIREBASE variables
 
-# Payment Gateways (Cashfree / Razorpay)
-CASHFREE_APP_ID="your_app_id"
-CASHFREE_SECRET_KEY="your_secret_key"
+# Payment Gateway (PayU) — booking UPI QR + dealer wallet top-up
+PAYU_KEY="your_merchant_key"
+PAYU_SALT="your_merchant_salt"
+PAYU_ENV="test"            # "production" for live
+PAYU_CALLBACK_BASE_URL="https://api.mrbikedoctor.cloud"
 RAZORPAY_KEY_ID="your_razorpay_key"
 RAZORPAY_KEY_SECRET="your_razorpay_secret"
 
@@ -92,7 +94,7 @@ AWS_S3_BUCKET="your_bucket_name"
 ## 🛠 Features
 
 - **Booking Management**: Real-time service booking and tracking via Socket.io.
-- **Payment Integration**: Support for Cashfree and Razorpay.
+- **Payment Integration**: PayU (booking UPI QR, dealer wallet top-up).
 - **AI Integration**: Powered by Google Gemini for intelligent bike diagnostics or automation.
 - **Notifications**: Push notifications via Firebase and SMS via Twilio Verify where applicable.
 - **Storage**: Image uploads managed via AWS S3.

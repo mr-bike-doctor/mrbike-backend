@@ -280,7 +280,10 @@ const { Server } = require("socket.io");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 const validateProductionEnv = require("./config/validateProductionEnv");
 validateProductionEnv();
-require("./config/reportSoftposConfig")();
+console.log("[PAYU_QR] config", {
+  configured: Boolean(process.env.PAYU_KEY && process.env.PAYU_SALT),
+  env: String(process.env.PAYU_ENV || "test"),
+});
 
 const apiRouter = require("./routes/index");
 const db = require("./models/index");

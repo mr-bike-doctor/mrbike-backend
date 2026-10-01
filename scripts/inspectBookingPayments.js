@@ -63,7 +63,7 @@ const minutesFromNow = (value) => {
           gateway_status: row.gateway_status,
           payment_type: row.payment_type,
           orderAmount: row.orderAmount,
-          cashfree_resource: row.metadata?.cashfree_resource || null,
+          gateway: row.metadata?.gateway || "LEGACY",
           expiry_time: row.metadata?.expiry_time || null,
           minutes_remaining: minutesFromNow(row.metadata?.expiry_time),
           qr_code_present: Boolean(row.metadata?.qr_code),
@@ -88,19 +88,18 @@ const minutesFromNow = (value) => {
   if (rows.some((row) => row.order_status === "SUCCESS")) {
     console.log("  Booking is already paid — generate-qr must refuse.");
   } else if (!pending.length) {
-    console.log("  No PENDING row — generate-qr will mint a fresh SOFTPOS_QR attempt.");
+    console.log("  No PENDING row — generate-qr will mint a fresh PayU QR attempt.");
   } else {
     for (const row of pending) {
-      const resource = row.metadata?.cashfree_resource || "UNTAGGED";
       const remaining = minutesFromNow(row.metadata?.expiry_time);
-      if (resource !== "SOFTPOS_QR") {
-        console.log(`  PENDING ${resource} ${row.orderId} — legacy, never reused; must be retired.`);
+      if (row.metadata?.gateway !== "PAYU") {
+        console.log(`  PENDING LEGACY ${row.orderId} — retired gateway, never reused; closed locally on next generate-qr.`);
       } else if (remaining === null || remaining <= 0) {
-        console.log(`  PENDING SOFTPOS_QR ${row.orderId} (attempt ${row.payment_attempt}) is expired — generate-qr verifies, terminates it, then mints the next attempt.`);
+        console.log(`  PENDING PAYU ${row.orderId} (attempt ${row.payment_attempt}) is expired — generate-qr cancels it at PayU, then mints the next attempt.`);
       } else if (!row.metadata?.qr_code) {
-        console.log(`  PENDING SOFTPOS_QR ${row.orderId} has no stored QR (stage ${row.metadata?.softpos_stage}) — must be retired.`);
+        console.log(`  PENDING PAYU ${row.orderId} has no stored QR (stage ${row.metadata?.payu_stage}) — must be retired.`);
       } else {
-        console.log(`  PENDING SOFTPOS_QR ${row.orderId} is live (${remaining} min left) — reuse it.`);
+        console.log(`  PENDING PAYU ${row.orderId} is live (${remaining} min left) — reuse it.`);
       }
     }
   }

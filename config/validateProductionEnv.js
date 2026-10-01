@@ -2,8 +2,6 @@ const REQUIRED_PRODUCTION_ENV = [
   "NODE_ENV",
   "BACKEND_URL",
   "FRONTEND_URL",
-  "CASHFREE_APP_ID",
-  "CASHFREE_SECRET_KEY",
 ];
 
 function validateHttpsUrl(name, value) {
@@ -32,8 +30,11 @@ function validateProductionEnv() {
     throw new Error('NODE_ENV must be set to "production"');
   }
 
-  if (process.env.CASHFREE_ENV !== "production") {
-    throw new Error('CASHFREE_ENV must be set to "production"');
+  // Booking UPI QR answers 503 until PayU is configured; never block startup.
+  if (!process.env.PAYU_KEY?.trim() || !process.env.PAYU_SALT?.trim()) {
+    console.warn("[PAYU_QR] PAYU_KEY / PAYU_SALT missing — booking UPI QR is disabled");
+  } else if (process.env.PAYU_ENV !== "production") {
+    console.warn('[PAYU_QR] PAYU_ENV is not "production" — QR requests go to test.payu.in');
   }
 
   validateHttpsUrl("BACKEND_URL", process.env.BACKEND_URL);

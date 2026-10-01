@@ -10,7 +10,7 @@ This is the **BikeDoctor** backend REST API server. It powers the customer mobil
 - **Auth:** JWT (jsonwebtoken) + bcryptjs
 - **Real-time:** Socket.IO 4.x (ticket room-based events)
 - **File Storage:** AWS S3 (multer-s3) + local uploads fallback
-- **Payments:** Razorpay + Cashfree (UPI QR)
+- **Payments:** PayU (booking Dynamic UPI QR + dealer wallet top-up)
 - **Notifications:** Firebase Admin SDK (FCM push) + Twilio (SMS/OTP)
 - **AI:** Google Gemini API + OpenAI + Azure Form Recognizer (OCR)
 - **Email:** Nodemailer
@@ -110,7 +110,7 @@ TWILIO_*=               # Twilio credentials for OTP SMS
 FIREBASE_*=             # Firebase Admin SDK credentials
 AWS_*=                  # S3 bucket credentials
 RAZORPAY_*=             # Razorpay payment keys
-CASHFREE_*=             # Cashfree payment keys
+PAYU_*=                 # PayU key/salt/env/callback base URL
 GEMINI_API_KEY=         # Google Gemini API key
 OPENAI_API_KEY=         # OpenAI API key
 ```

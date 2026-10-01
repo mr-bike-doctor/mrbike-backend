@@ -2,48 +2,47 @@ const express = require("express")
 const router = express.Router()
 const { requireAdmin } = require("../middlewares/requireAdmin")
 const { requireBookingParticipant, requirePaymentParticipant, requireActorRole } = require("../middlewares/bookingAuth")
-const cashfreeWebhookSecurity = require("../middlewares/cashfreeWebhookSecurity")
 const {
   generateUPIQRCode,
   checkPaymentStatus,
-  cashfreeWebhook,
+  payuWebhook,
   getPaymentByBooking,
   regenerateQRCode,
   cancelPayment,
   getAllQRPayments,
-} = require("../controller/cashfreeQRController")
+} = require("../controller/payuQRController")
 
 /**
- * Cashfree UPI QR Payment Routes
- * Base path: /bikedoctor/cashfree
+ * PayU Dynamic UPI QR Payment Routes
+ * Base path: /bikedoctor/payu
  */
 
 // Generate UPI QR Code for payment (Dealer App)
-// POST /bikedoctor/cashfree/generate-qr
+// POST /bikedoctor/payu/generate-qr
 router.post("/generate-qr", requireBookingParticipant(req => req.body.booking_id), requireActorRole("dealer"), generateUPIQRCode)
 
 // Check payment status (Polling from Dealer App)
-// GET /bikedoctor/cashfree/status/:order_id
+// GET /bikedoctor/payu/status/:order_id
 router.get("/status/:order_id", requirePaymentParticipant(req => ({ orderId: req.params.order_id })), checkPaymentStatus)
 
-// Cashfree Webhook (Called by Cashfree)
-// POST /bikedoctor/cashfree/webhook
-router.post("/webhook", cashfreeWebhookSecurity, cashfreeWebhook)
+// PayU transaction callback (webhook + surl/furl). Reverse hash is verified in the handler.
+// POST /bikedoctor/payu/webhook
+router.post("/webhook", payuWebhook)
 
 // Get payment details by booking ID
-// GET /bikedoctor/cashfree/booking/:booking_id
+// GET /bikedoctor/payu/booking/:booking_id
 router.get("/booking/:booking_id", requireBookingParticipant(req => req.params.booking_id), getPaymentByBooking)
 
-// Regenerate QR code for pending payment
-// POST /bikedoctor/cashfree/regenerate/:payment_id
+// Re-serve the QR of a still-live attempt
+// POST /bikedoctor/payu/regenerate/:payment_id
 router.post("/regenerate/:payment_id", requirePaymentParticipant(req => ({ _id: req.params.payment_id })), requireActorRole("dealer"), regenerateQRCode)
 
 // Cancel pending payment
-// DELETE /bikedoctor/cashfree/cancel/:order_id
+// DELETE /bikedoctor/payu/cancel/:order_id
 router.delete("/cancel/:order_id", requirePaymentParticipant(req => ({ orderId: req.params.order_id })), requireActorRole("dealer"), cancelPayment)
 
 // Get all QR payments with filters
-// GET /bikedoctor/cashfree/payments
+// GET /bikedoctor/payu/payments
 router.get("/payments", requireAdmin, getAllQRPayments)
 
 module.exports = router

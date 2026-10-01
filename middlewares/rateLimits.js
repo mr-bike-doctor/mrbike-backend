@@ -34,7 +34,7 @@ function selectLimiter(req) {
   if (/send-otp|sendotp|resendotp|regenerate-delivery-otp/.test(path)) return limiters.otpSend;
   if (/reset.*password|forgot.*password|change[-_]?password|changepassword/.test(path)) return limiters.passwordReset;
   if (/login|signin/.test(path)) return limiters.login;
-  if (/payment|cashfree|invoice|checkout|\bbills?\b/.test(path)) return limiters.payment;
+  if (/payment|cashfree|payu|invoice|checkout|\bbills?\b/.test(path)) return limiters.payment;
   if (/referral/.test(path)) return isRead(method) ? null : limiters.referral;
   if (/ticket|support/.test(path)) return isRead(method) ? null : limiters.support;
   return null;

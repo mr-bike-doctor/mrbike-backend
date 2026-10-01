@@ -2993,7 +2993,7 @@ const selectPaymentMethod = async (req, res) => {
       });
     }
 
-    // Cancel any pending Cashfree session left over from a previous method
+    // Cancel any pending gateway session left over from a previous method
     // choice (e.g. dealer switched ONLINE → CASH after a QR was shown) so a
     // stale, abandoned order can never be paid later and mistaken by the
     // webhook for the customer's current session.
@@ -3008,12 +3008,12 @@ const selectPaymentMethod = async (req, res) => {
     const io = req.app.get("io");
 
     // ── ONLINE (QR) PATH ───────────────────────────────────────────────────────
-    // QR generation itself is handled by the existing Cashfree UPI-QR flow
-    // (POST /cashfree/generate-qr), which already lands on the same
+    // QR generation itself is handled by the PayU Dynamic UPI-QR flow
+    // (POST /payu/generate-qr), which already lands on the same
     // invoice + wallet-settlement + delivery-OTP outcome as confirmCashReceived
     // once payment succeeds. We only flip the booking into payment_selected
     // (done above) and point the dealer at that endpoint — no second/duplicate
-    // Cashfree order integration here.
+    // gateway integration here.
     if (payment_method === "ONLINE") {
       try {
         const dealer = await Vendor.findById(bookingDoc.dealer_id)
@@ -3049,14 +3049,14 @@ const selectPaymentMethod = async (req, res) => {
       return res.status(200).json({
         success: true,
         payment_method: "ONLINE",
-        message: "Online payment selected. Generate a QR via /cashfree/generate-qr to collect payment.",
+        message: "Online payment selected. Generate a QR via /payu/generate-qr to collect payment.",
         data: {
           bookingId,
           status: "payment_selected",
           amount: bookingDoc.totalBill,
           next_step: {
             method: "POST",
-            path: "/bikedoctor/cashfree/generate-qr",
+            path: "/bikedoctor/payu/generate-qr",
             body: { booking_id: bookingId, amount: bookingDoc.totalBill },
           },
         },

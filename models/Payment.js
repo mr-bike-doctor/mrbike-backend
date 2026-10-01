@@ -63,7 +63,7 @@ const paymentSchema = new mongoose.Schema(
     },
     payment_method: {
       type: String,
-      enum: ["card", "netbanking", "upi", "wallet", "emi", "qrcode", null], // Added fields for Cashfree UPI QR payments
+      enum: ["card", "netbanking", "upi", "wallet", "emi", "qrcode", null], // Gateway payment group
       default: null,
     },
     cf_payment_id: {
@@ -90,8 +90,7 @@ const paymentSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
-    // Booking softPOS Dynamic QR (metadata.cashfree_resource = "SOFTPOS_QR")
-    // only. Null on wallet top-ups and historical PG_ORDER / PAYMENT_LINK rows.
+    // Historical rows from the retired gateway only (kept for old records).
     cf_terminal_id: {
       type: String,
       default: null,
@@ -105,7 +104,7 @@ const paymentSchema = new mongoose.Schema(
       default: null,
     },
     // Top-up only: guards a single Vendor.wallet + Wallet ledger credit for a
-    // successful Cashfree order across webhooks and authenticated status polls.
+    // successful PayU top-up across webhooks and authenticated status polls.
     wallet_credit_state: {
       type: String,
       enum: ["PENDING", "PROCESSING", "CREDITED"],

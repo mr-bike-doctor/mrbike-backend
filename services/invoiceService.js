@@ -51,7 +51,7 @@ function resolveDealerDetails(dealer) {
 
 // Core invoice creation — this is the exact logic that used to live in
 // controller/payment.js#generateBill, kept byte-for-byte so every existing
-// trigger (payment webhook, cashfree QR, cash-received/cash-confirm) keeps
+// trigger (PayU QR, cash-received/cash-confirm) keeps
 // working unchanged. This function does NOT gate on booking eligibility —
 // callers are trusted to invoke it only once payment is actually complete.
 // The one exception (booking-completed fallback) does its own gating before

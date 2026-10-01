@@ -82,7 +82,7 @@ walletSchema.index(
         name: "one_wallet_rollback_per_source_transaction",
     },
 );
-// A Cashfree wallet top-up order is an idempotency key. This also protects the
+// A wallet top-up order is an idempotency key. This also protects the
 // standalone-Mongo fallback in services/walletTopupService.js.
 walletSchema.index(
     { orderId: 1, transaction_type: 1 },

@@ -14,7 +14,7 @@ function transactionsUnsupported(error) {
 }
 
 // This is deliberately an order-level operation. A Payment may receive many
-// webhooks/status checks, but a successful Cashfree order may create only one
+// webhooks/status checks, but a successful PayU top-up may create only one
 // approved deposit row and one wallet credit.
 async function finalizeInTransaction(paymentId, session) {
   const payment = await Payment.findOneAndUpdate(
@@ -56,7 +56,7 @@ async function finalizeInTransaction(paymentId, session) {
     dealer_id: dealer._id,
     Amount: amount,
     Type: "Credit",
-    Note: `Wallet top-up via Cashfree (Order: ${payment.orderId}, Payment: ${payment.cf_payment_id || "pending"})`,
+    Note: `Wallet top-up via PayU (Order: ${payment.orderId}, Payment: ${payment.transaction_id || "pending"})`,
     Total: postBalance,
     pre_balance: preBalance,
     order_status: "APPROVED",
@@ -70,7 +70,7 @@ async function finalizeInTransaction(paymentId, session) {
 }
 
 // Safe fallback for standalone MongoDB. The Payment claim and unique deposit
-// index prevent a second worker from crediting the same Cashfree order.
+// index prevent a second worker from crediting the same top-up order.
 async function finalizeWithoutTransaction(paymentId) {
   // Recover the only safe interrupted-fallback case: ledger creation finished
   // but recording Payment.wallet_credit_state did not. Never re-apply money.
@@ -123,7 +123,7 @@ async function finalizeWithoutTransaction(paymentId) {
       dealer_id: dealer._id,
       Amount: amount,
       Type: "Credit",
-      Note: `Wallet top-up via Cashfree (Order: ${payment.orderId}, Payment: ${payment.cf_payment_id || "pending"})`,
+      Note: `Wallet top-up via PayU (Order: ${payment.orderId}, Payment: ${payment.transaction_id || "pending"})`,
       Total: postBalance,
       pre_balance: round2(postBalance - amount),
       order_status: "APPROVED",

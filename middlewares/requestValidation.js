@@ -94,18 +94,15 @@ const requiredRules = [
   { method: "POST", path: /\/adminauth\/verify-otp$/i, fields: ["phone", "otp"] },
   { method: "POST", path: /\/bikedoctor\/verify-otp$/i, fields: ["mobile", "otp"] },
   { method: "POST", path: /\/api\/v2\/bookings\/verify-otp$/i, fields: ["bookingId", "dealerId", "otp"] },
-  { method: "POST", path: /\/payment\/initiate$/i, fields: ["booking_id"] },
-  { method: "POST", path: /\/payment\/(create-checkout|link)$/i, fields: ["user_id", "dealer_id", "booking_id"] },
-  { method: "POST", path: /\/payment\/create-checkout-session$/i, fields: ["user_id", "dealer_id", "booking_id", "customer_email"] },
-  { method: "POST", path: /\/cashfree\/generate-qr$/i, fields: ["booking_id"] },
+  { method: "POST", path: /\/(payu|cashfree)\/generate-qr$/i, fields: ["booking_id"] },
   { method: "POST", path: /\/customers\/validateReferralCode$/i, fields: ["referralCode"] },
   { method: "POST", path: /\/ticket\/create\/[^/]+$/i, fields: ["subject", "message"] },
   { method: "POST", path: /\/ticket\/reply\/[^/]+$/i, fields: ["message"] },
 ];
 
 module.exports = function validateRequest(req, res, next) {
-  // Cashfree webhook bodies are authenticated against their exact raw bytes
-  // at the route boundary; do not inspect parsed webhook fields beforehand.
+  // PayU webhook/callback bodies are authenticated by their reverse hash in
+  // the handler; gateway field values (e.g. status=failure) are not ours.
   if (/\/webhook\/?$/i.test(req.originalUrl.split("?")[0])) return next();
 
   const errors = [];
