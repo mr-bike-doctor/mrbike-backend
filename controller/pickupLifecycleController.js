@@ -61,6 +61,17 @@ function locationSet(location, now) {
 }
 
 async function notifyCustomer(req, bookingDoc, event, title, body, extraData = {}) {
+  // Socket delivery is independent from FCM. A stale/missing device token must
+  // never prevent an already-connected customer from receiving the lifecycle
+  // update (especially a regenerated OTP notification).
+  const io = req.app.get("io");
+  if (io) {
+    io.to(`booking:${bookingDoc._id}`).emit(`pickup:${event}`, {
+      bookingId: String(bookingDoc._id),
+      pickupStatus: bookingDoc.pickupStatus,
+    });
+  }
+
   try {
     const customer = await Customer.findById(bookingDoc.user_id)
       .select("device_token ftoken")
@@ -74,14 +85,6 @@ async function notifyCustomer(req, bookingDoc, event, title, body, extraData = {
       receiverType: "user",
       bookingId: bookingDoc._id,
     });
-
-    const io = req.app.get("io");
-    if (io) {
-      io.to(`booking:${bookingDoc._id}`).emit(`pickup:${event}`, {
-        bookingId: String(bookingDoc._id),
-        pickupStatus: bookingDoc.pickupStatus,
-      });
-    }
   } catch (error) {
     // Notification delivery must not roll back an already-valid lifecycle transition.
     console.error(`[PICKUP-NOTIFICATION] ${event} failed:`, error.message);

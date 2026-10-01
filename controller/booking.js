@@ -1979,9 +1979,12 @@ const sendOtpToMobile = async (req, res) => {
       return res.status(200).json({ success: false, message: "Booking ID is required" });
     }
 
-    // 1) Fetch booking + user
+    // This legacy URL is still used by the provider's SELF_VISIT resend
+    // action. Keep the OTP on the booking because that is both what
+    // verifyBookingOTP validates and what the customer booking screen shows.
     const bookingData = await booking
       .findById(bookingId)
+      .select("+pickupOtp")
       .populate("user_id", "phone first_name last_name");
 
     if (!bookingData) {
@@ -1991,27 +1994,38 @@ const sendOtpToMobile = async (req, res) => {
       return res.status(200).json({ success: false, message: "User phone number not found" });
     }
 
+    if (isPickupBooking(bookingData)) {
+      return res.status(400).json({
+        success: false,
+        message: "Use the tracked pickup resend endpoint for pickup bookings",
+      });
+    }
+    if (bookingData.status !== "confirmed" || bookingData.pickupStatus !== "arrived") {
+      return res.status(409).json({
+        success: false,
+        message: "Visit OTP can be resent only after customer arrival",
+      });
+    }
+
     const rawPhone = bookingData.user_id.phone;
     const ten = normalize10(rawPhone);
     const e164 = with91(ten);
 
-    // 2) Find the same customer by any stored representation (Number/String, 10/12 digits)
-    const customer =
-      await customers.findOne({ phone: { $in: [Number(ten), ten, Number(e164), e164] } }) ||
-      await customers.findById(bookingData.user_id._id); // fallback by id, just in case
+    // Rotate the same field consumed by the provider verification endpoint and
+    // returned by the authenticated customer booking-details endpoint.
+    const otp = genOtp();
+    bookingData.pickupOtp = otp;
+    await bookingData.save();
 
-    if (!customer) {
-      return res.status(200).json({ success: false, message: "User not found for this booking" });
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`booking:${bookingData._id}`).emit("pickup:otp-regenerated", {
+        bookingId: String(bookingData._id),
+        pickupStatus: bookingData.pickupStatus,
+      });
     }
 
-    // 3) Generate & save OTP on customer
-    const otp = genOtp();
-    customer.otp = otp;
-    // Optional expiry support if you add it to schema:
-    // customer.otpExpiry = new Date(Date.now() + 5 * 60 * 1000);
-    await customer.save();
-
-    // 4) Send SMS (plug your provider here)
+    // Send SMS here as an optional secondary channel.
     // await sendSms(`+${e164}`, `Your OTP is ${otp}`);
 
     return res.status(200).json({
@@ -3414,6 +3428,17 @@ const regenerateDeliveryOtp = async (req, res) => {
     await bookingDoc.save();
 
     console.log(`[REGEN-OTP] Booking ${bookingId} | regen #${bookingDoc.otp_regen_count}`);
+
+    // The customer app joins this booking-scoped room while the booking detail
+    // screen is open. Do not put the OTP in the socket payload; the app obtains
+    // it from the authenticated booking-details endpoint.
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`booking:${bookingDoc._id}`).emit("delivery:otp-regenerated", {
+        bookingId: String(bookingDoc._id),
+        status: bookingDoc.status,
+      });
+    }
 
     // Push new OTP to user — in data payload only
     try {
