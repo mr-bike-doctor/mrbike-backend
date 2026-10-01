@@ -24,6 +24,7 @@ const {
   computePriceBreakdown,
   computeTransportCharges,
   resolveServiceAmount,
+  resolveServiceLines,
   applyBreakdownToBooking,
   applyRewardDiscount,
   round2,
@@ -33,6 +34,8 @@ const {
   isTowingRequired,
   resolveTowingCharge,
   PricingError,
+  resolveBikeCC,
+  findPriceRowForCC,
 } = require("../services/pricingEngine");
 const { getPricingSettings } = require("../services/appSettingsService");
 const { validatePromoCode } = require("../services/promoService");
@@ -905,7 +908,7 @@ async function createBooking(req, res) {
     if (!bikeData) {
       return res.status(400).json({ success: false, message: "User bike not found" });
     }
-    const bikeCC = parseInt(bikeData.variant_id?.engine_cc || bikeData.bike_cc || 0);
+    const bikeCC = resolveBikeCC(bikeData);
 
     // ── Single Active Booking Per Bike ────────────────────────────────────────
     // Server-side source of truth: a bike cannot have two non-final bookings
@@ -1000,16 +1003,17 @@ async function createBooking(req, res) {
 
     // ── Call pricingEngine.computePriceBreakdown() ─────────────────────────────
     let breakdown;
+    const serviceLines = resolveServiceLines({
+      services: serviceDocs,
+      additionalServices: additionalServiceDocs,
+      bikeCC,
+      bikeContext: {
+        variantId: bikeData.variant_id?._id || bikeData.variant_id,
+        modelId: bikeData.variant_id?.model_id,
+      },
+    });
     try {
-      const serviceAmount = resolveServiceAmount({
-        services: serviceDocs,
-        additionalServices: additionalServiceDocs,
-        bikeCC,
-        bikeContext: {
-          variantId: bikeData.variant_id?._id || bikeData.variant_id,
-          modelId: bikeData.variant_id?.model_id,
-        },
-      });
+      const serviceAmount = round2(serviceLines.reduce((sum, line) => sum + line.price, 0));
 
       // ── Re-validate promo code at creation time ─────────────────────────────
       // Never trust a discount the client echoes back from the earlier
@@ -1114,7 +1118,7 @@ async function createBooking(req, res) {
 
     // Single sanctioned path for writing the pricing snapshot onto a Booking
     // document — see services/pricingEngine.js#applyBreakdownToBooking().
-    applyBreakdownToBooking(newBooking, breakdown);
+    applyBreakdownToBooking(newBooking, breakdown, { serviceLines });
     newBooking.mrBikeMoneyLimit = breakdown.mrBikeMoneyLimit || 0;
 
     let moneyDebited = false;
@@ -1378,6 +1382,9 @@ async function updateBooking(req, res) {
     // NEVER just patch a total — it must trigger a full pricingEngine recompute
     // below (see "service list changed" block).
     let additionalServicesChanged = false;
+    const previousAdditionalIds = new Set(
+      (existingBooking.additionalServices || []).map((id) => String(id))
+    );
     if (Object.prototype.hasOwnProperty.call(updateFields, "services")) {
       const services = updateFields.services;
 
@@ -1426,6 +1433,42 @@ async function updateBooking(req, res) {
       }
     }
 
+    // Ids the dealer is adding on this save (not ones already on the booking).
+    const addedAdditionalIds = additionalServicesChanged
+      ? (existingBooking.additionalServices || [])
+          .map((id) => String(id))
+          .filter((id) => !previousAdditionalIds.has(id))
+      : [];
+    const additionalListDiffers =
+      additionalServicesChanged &&
+      (addedAdditionalIds.length > 0 ||
+        (existingBooking.additionalServices || []).length !== previousAdditionalIds.size);
+
+    // Same rule as the towing endpoint: the service list — and so the price —
+    // may only move while the customer still owes the money. Once the booking
+    // is paid or invoiced, the invoice is already issued for the old list, and
+    // a late addition would sit on the booking without ever reaching the bill.
+    // A save that merely re-asserts the current list (the "mark complete"
+    // flow does this) is not a change and is let through without a recompute.
+    if (additionalServicesChanged) {
+      const isClosedForPricing =
+        existingBooking.billStatus === "paid" ||
+        existingBooking.payment_status === "completed" ||
+        existingBooking.billGenerated === true ||
+        ["rejected", "user_cancelled", "cancelled", "expired", "delivered"].includes(existingBooking.status);
+
+      if (isClosedForPricing) {
+        if (additionalListDiffers) {
+          return res.status(409).json({
+            success: false,
+            message: "Services can no longer be changed — this booking is already billed, paid or closed.",
+            code: "BOOKING_CLOSED_FOR_PRICING",
+          });
+        }
+        additionalServicesChanged = false;
+      }
+    }
+
     // --- apply ONLY whitelisted business fields — never a raw field spread ---
     UPDATE_BOOKING_ALLOWED_FIELDS.forEach((key) => {
       if (updateFields[key] !== undefined) {
@@ -1444,23 +1487,45 @@ async function updateBooking(req, res) {
           .select("bike_cc variant_id")
           .populate({ path: "variant_id", select: "model_id engine_cc" }),
         AdminService.find({ _id: { $in: existingBooking.services } }).select("bikes"),
-        AdditionalService.find({ _id: { $in: existingBooking.additionalServices } }).select("bikes"),
+        AdditionalService.find({ _id: { $in: existingBooking.additionalServices } })
+          .select("bikes base_additional_service_id")
+          .populate("base_additional_service_id", "name"),
       ]);
 
       if (!dealer) {
         return res.status(404).json({ success: false, message: "Dealer not found for this booking" });
       }
 
-      const bikeCC = parseInt(bikeData?.variant_id?.engine_cc || bikeData?.bike_cc || 0);
-      const serviceAmount = resolveServiceAmount({
-        services: mainDocs,
-        additionalServices: addlDocs,
-        bikeCC,
-        bikeContext: {
-          variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
-          modelId: bikeData?.variant_id?.model_id,
-        },
-      });
+      const bikeCC = resolveBikeCC(bikeData);
+      const bikeContext = {
+        variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
+        modelId: bikeData?.variant_id?.model_id,
+      };
+
+      // An additional service with no price row for THIS bike would be priced
+      // at ₹0 by resolveServiceAmount — it would show on the job and the
+      // invoice while never being charged. Refuse it instead, so the garage
+      // knows the price has to be set for this bike first. Only newly added
+      // services are checked; one already on the booking is left alone.
+      const addedSet = new Set(addedAdditionalIds);
+      const unpriced = addlDocs.filter(
+        (doc) => addedSet.has(String(doc._id)) && !findPriceRowForCC(doc, bikeCC, bikeContext)
+      );
+      if (unpriced.length > 0) {
+        const names = unpriced
+          .map((doc) => doc.base_additional_service_id?.name || "Additional service")
+          .join(", ");
+        return res.status(400).json({
+          success: false,
+          message: `${names}: no price is set for this bike. Ask MR Bike to add a price for this bike before adding the service.`,
+          code: "ADDITIONAL_SERVICE_UNPRICED",
+          unpriced: unpriced.map((doc) => String(doc._id)),
+        });
+      }
+
+      const pricingInput = { services: mainDocs, additionalServices: addlDocs, bikeCC, bikeContext };
+      const serviceLines = resolveServiceLines(pricingInput);
+      const serviceAmount = resolveServiceAmount(pricingInput);
 
       let breakdown;
       try {
@@ -1491,7 +1556,7 @@ async function updateBooking(req, res) {
         throw pricingError;
       }
 
-      applyBreakdownToBooking(existingBooking, breakdown);
+      applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
     }
 
     await existingBooking.save();
@@ -3562,8 +3627,8 @@ async function updateTowingCharge(req, res) {
       return res.status(404).json({ success: false, message: "Dealer not found for this booking" });
     }
 
-    const bikeCC = parseInt(bikeData?.variant_id?.engine_cc || bikeData?.bike_cc || 0);
-    const serviceAmount = resolveServiceAmount({
+    const bikeCC = resolveBikeCC(bikeData);
+    const pricingInput = {
       services: mainDocs,
       additionalServices: addlDocs,
       bikeCC,
@@ -3571,7 +3636,9 @@ async function updateTowingCharge(req, res) {
         variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
         modelId: bikeData?.variant_id?.model_id,
       },
-    });
+    };
+    const serviceLines = resolveServiceLines(pricingInput);
+    const serviceAmount = resolveServiceAmount(pricingInput);
 
     let breakdown;
     try {
@@ -3603,7 +3670,7 @@ async function updateTowingCharge(req, res) {
       throw pricingError;
     }
 
-    applyBreakdownToBooking(existingBooking, breakdown);
+    applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
     existingBooking.towingChargeUpdatedAt = new Date();
     existingBooking.towingChargeUpdatedByRole = req.auth?.role === "admin" ? "admin" : "dealer";
     await existingBooking.save();

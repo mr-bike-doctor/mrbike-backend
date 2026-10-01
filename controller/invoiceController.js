@@ -1,7 +1,12 @@
 const mongoose = require("mongoose");
 const Booking = require("../models/Booking");
 const Bill = require("../models/billSchema");
-const { getOrCreateInvoice, backfillBikeRegistration, buildInvoiceResponse } = require("../services/invoiceService");
+const {
+    getOrCreateInvoice,
+    backfillBikeRegistration,
+    refreshBillServiceLines,
+    buildInvoiceResponse,
+} = require("../services/invoiceService");
 
 const BILL_STATUS_VALUES = ["paid", "pending", "cancelled"];
 
@@ -93,6 +98,14 @@ const getInvoice = async (req, res) => {
             // Older bills stored the bike registration as "N/A"; repair them
             // from the booking's bike the first time they are opened.
             await backfillBikeRegistration(bill);
+            // …and priced their service rows with a CC-only lookup, so an
+            // additional service could print at ₹0. Never fatal: the stored
+            // bill is still a valid invoice if the repair can't run.
+            try {
+                await refreshBillServiceLines(bill);
+            } catch (repairError) {
+                console.error("Invoice service-row repair failed:", repairError.message);
+            }
         }
 
         return res.status(200).json({
@@ -110,6 +123,41 @@ const getInvoice = async (req, res) => {
     }
 };
 
+// How many missing invoices one list request will create. Keeps the first
+// load after deploy bounded for a dealer with a long paid history; the rest
+// are picked up on the following loads.
+const BACKFILL_BATCH_SIZE = 25;
+
+// A Bill is normally written when payment completes, but bookings paid before
+// that trigger existed — or whose bill generation failed — never got one,
+// and the list below reads Bills only, so those bookings were simply missing
+// from the dealer's Invoices screen. Create their bills here, under the same
+// gate getInvoice uses (billStatus "paid"), dated when the booking was paid.
+async function backfillMissingDealerInvoices(dealerId) {
+    const paidBookings = await Booking.find({ dealer_id: dealerId, billStatus: "paid" })
+        .select("_id payment_method delivered_at updatedAt")
+        .sort({ updatedAt: -1 })
+        .lean();
+    if (paidBookings.length === 0) return;
+
+    const billed = await Bill.find({ booking_id: { $in: paidBookings.map((b) => b._id) } })
+        .select("booking_id")
+        .lean();
+    const billedIds = new Set(billed.map((b) => String(b.booking_id)));
+    const missing = paidBookings.filter((b) => !billedIds.has(String(b._id))).slice(0, BACKFILL_BATCH_SIZE);
+
+    for (const booking of missing) {
+        try {
+            await getOrCreateInvoice(booking._id, {
+                payment_method: booking.payment_method || "N/A",
+                bill_date: booking.delivered_at || booking.updatedAt || null,
+            });
+        } catch (error) {
+            console.error(`Invoice backfill failed for booking ${booking._id}:`, error.message);
+        }
+    }
+}
+
 // GET /bikedoctor/invoice/dealer/:dealerId
 // Lightweight, paginated invoice history for the Dealer App's Invoices list
 // screen. Bill already denormalizes customer/bike/amount at invoice-creation
@@ -126,6 +174,15 @@ const getDealerInvoices = async (req, res) => {
         }
 
         const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+
+        // Only on the first page, so scrolling never re-runs it.
+        if (page === 1) {
+            try {
+                await backfillMissingDealerInvoices(new mongoose.Types.ObjectId(dealerId));
+            } catch (backfillError) {
+                console.error("Dealer invoice backfill failed:", backfillError.message);
+            }
+        }
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
         const skip = (page - 1) * limit;
 

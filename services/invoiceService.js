@@ -2,7 +2,7 @@ const Booking = require("../models/Booking");
 const Bill = require("../models/billSchema");
 const Dealer = require("../models/dealerModel");
 const InvoiceCounter = require("../models/invoiceCounterModel");
-const { PRICING_WRITE_BYPASS_FLAG, round2 } = require("./pricingEngine");
+const { PRICING_WRITE_BYPASS_FLAG, round2, resolvePriceForCC, resolveBikeCC } = require("./pricingEngine");
 const {
     MR_BIKE_SUPPORT_PHONE,
     MR_BIKE_SUPPORT_EMAIL,
@@ -49,21 +49,8 @@ function resolveDealerDetails(dealer) {
     };
 }
 
-// Core invoice creation — this is the exact logic that used to live in
-// controller/payment.js#generateBill, kept byte-for-byte so every existing
-// trigger (PayU QR, cash-received/cash-confirm) keeps
-// working unchanged. This function does NOT gate on booking eligibility —
-// callers are trusted to invoke it only once payment is actually complete.
-// The one exception (booking-completed fallback) does its own gating before
-// calling this; see controller/booking.js.
-async function getOrCreateInvoice(bookingId, paymentMeta = {}) {
-    const existingBill = await Bill.findOne({ booking_id: bookingId });
-    if (existingBill) {
-        console.log(`📄 Invoice already exists for booking: ${bookingId}`);
-        return existingBill;
-    }
-
-    const booking = await Booking.findById(bookingId)
+function loadBookingForInvoice(bookingId) {
+    return Booking.findById(bookingId)
         .populate("user_id", "first_name last_name email phone")
         .populate({
             path: "userBike_id",
@@ -95,52 +82,86 @@ async function getOrCreateInvoice(bookingId, paymentMeta = {}) {
             select: "bikes",
             populate: { path: "base_additional_service_id", select: "name" },
         });
+}
+
+// One row per service on the booking, priced the way the booking itself was.
+//
+// The booking's own `serviceLines` (written with the pricing snapshot) is
+// the record of what each service was charged at, so it wins whenever it is
+// there. Bookings priced before it existed are re-priced with the pricing
+// engine's own resolver and bike context — the exact rule `serviceAmount`
+// was computed with. The old code here matched the raw `bike_cc` only, with
+// no variant/model context, so a service the snapshot priced from a
+// variant-specific row (or a decimal engine_cc) came out at a different
+// price, or at ₹0, on the invoice.
+function buildServiceLineItems(booking) {
+    const userBike = booking.userBike_id;
+    const variant = userBike?.variant_id;
+    const bikeCC = resolveBikeCC(userBike);
+    const bikeContext = {
+        variantId: variant?._id || variant || null,
+        modelId: variant?.model_id?._id || variant?.model_id || null,
+    };
+
+    // Snapshot prices keyed by kind+id. A list, not a single value, so the
+    // same service on a booking twice consumes one stored line each.
+    const stored = new Map();
+    for (const line of booking.serviceLines || []) {
+        const key = `${line.kind}:${String(line.ref)}`;
+        if (!stored.has(key)) stored.set(key, []);
+        stored.get(key).push(Number(line.price) || 0);
+    }
+    const priceOf = (kind, doc) => {
+        const queue = stored.get(`${kind}:${String(doc?._id)}`);
+        if (queue && queue.length) return round2(queue.shift());
+        return round2(resolvePriceForCC(doc, bikeCC, bikeContext));
+    };
+
+    const lines = [];
+    (booking.services || []).forEach((svc) => {
+        const price = priceOf("service", svc);
+        lines.push({ name: svc?.base_service_id?.name || "Service", price, quantity: 1, total: price });
+    });
+    (booking.additionalServices || []).forEach((svc) => {
+        const price = priceOf("additional", svc);
+        const name = svc?.base_additional_service_id?.name || "Additional Service";
+        lines.push({ name: `Additional: ${name}`, price, quantity: 1, total: price });
+    });
+
+    if (lines.length === 0 && booking.serviceSummary && booking.serviceSummary.length > 0) {
+        booking.serviceSummary.forEach((service) => {
+            if (service.serviceName) {
+                const price = Number(service.price) || 0;
+                lines.push({ name: service.serviceName, price, quantity: 1, total: price });
+            }
+        });
+    }
+
+    return lines;
+}
+
+// Core invoice creation — this is the exact logic that used to live in
+// controller/payment.js#generateBill, kept byte-for-byte so every existing
+// trigger (PayU QR, cash-received/cash-confirm) keeps
+// working unchanged. This function does NOT gate on booking eligibility —
+// callers are trusted to invoke it only once payment is actually complete.
+// The one exception (booking-completed fallback) does its own gating before
+// calling this; see controller/booking.js.
+async function getOrCreateInvoice(bookingId, paymentMeta = {}) {
+    const existingBill = await Bill.findOne({ booking_id: bookingId });
+    if (existingBill) {
+        console.log(`📄 Invoice already exists for booking: ${bookingId}`);
+        return existingBill;
+    }
+
+    const booking = await loadBookingForInvoice(bookingId);
 
     if (!booking) {
         throw new Error("Booking not found for invoice generation");
     }
 
-    const bikeCC = parseInt(booking.userBike_id?.bike_cc || 0);
-    const resolvePrice = (doc) => {
-        if (!doc || !Array.isArray(doc.bikes)) return 0;
-        const match = doc.bikes.find((b) => b.cc === bikeCC);
-        return match ? match.price : 0;
-    };
-
-    const services = [];
-    let subtotal = 0;
-
-    if (booking.services && booking.services.length > 0) {
-        booking.services.forEach((svc) => {
-            const name = svc.base_service_id?.name || "Service";
-            const price = resolvePrice(svc);
-            services.push({ name, price, quantity: 1, total: price });
-            subtotal += price;
-        });
-    }
-
-    if (booking.additionalServices && booking.additionalServices.length > 0) {
-        booking.additionalServices.forEach((svc) => {
-            const name = svc.base_additional_service_id?.name || "Additional Service";
-            const price = resolvePrice(svc);
-            services.push({ name: `Additional: ${name}`, price, quantity: 1, total: price });
-            subtotal += price;
-        });
-    }
-
-    if (services.length === 0 && booking.serviceSummary && booking.serviceSummary.length > 0) {
-        booking.serviceSummary.forEach((service) => {
-            if (service.serviceName) {
-                services.push({
-                    name: service.serviceName,
-                    price: service.price || 0,
-                    quantity: 1,
-                    total: service.price || 0,
-                });
-                subtotal += service.price || 0;
-            }
-        });
-    }
+    const services = buildServiceLineItems(booking);
+    let subtotal = round2(services.reduce((sum, line) => sum + line.total, 0));
 
     // Pricing is the frozen snapshot taken by pricingEngine at booking
     // creation — never recomputed from the dealer's current settings.
@@ -227,7 +248,9 @@ async function getOrCreateInvoice(bookingId, paymentMeta = {}) {
         booking_number: booking.bookingId || null,
         payment_id: paymentMeta.payment_id || null,
         bill_number: billNumber,
-        bill_date: new Date(),
+        // A bill backfilled for an older paid booking is dated when that
+        // booking was paid/delivered, not the day someone first opened it.
+        bill_date: paymentMeta.bill_date || new Date(),
         customer_details: {
             name: `${booking.user_id.first_name} ${booking.user_id.last_name}`,
             email: booking.user_id.email,
@@ -266,7 +289,7 @@ async function getOrCreateInvoice(bookingId, paymentMeta = {}) {
         payment_details: {
             payment_method: paymentMeta.payment_method || "online",
             transaction_id: paymentMeta.transaction_id,
-            payment_date: new Date(),
+            payment_date: paymentMeta.bill_date || new Date(),
         },
         status: "generated",
     });
@@ -308,6 +331,53 @@ async function getOrCreateInvoice(bookingId, paymentMeta = {}) {
         );
     }
 
+    return bill;
+}
+
+// The rows getOrCreateInvoice appends after the services for the transport
+// charges. They are carried over untouched when the service rows are rebuilt.
+const TRANSPORT_ROW_NAMES = new Set(["Pickup Charges", "Drop Charges", "Towing Charges"]);
+
+// Bills issued before buildServiceLineItems priced their service rows with a
+// CC-only lookup, so a service could print at the wrong amount — or ₹0 — even
+// though the bill's totals (taken from the booking snapshot) were right.
+// Rebuild those rows from the booking the first time the invoice is opened.
+//
+// Only the rows are ever rewritten, never a total, and only when the rebuilt
+// rows add up to exactly the service amount this bill already charged. A
+// booking whose services changed after the bill was issued fails that check
+// and keeps the bill it was paid against.
+async function refreshBillServiceLines(bill) {
+    if (!bill) return bill;
+
+    const booking = await loadBookingForInvoice(bill.booking_id);
+    if (!booking || !booking.pricingVersion) return bill;
+
+    const serviceRows = buildServiceLineItems(booking);
+    if (serviceRows.length === 0) return bill;
+
+    const billedServiceAmount = round2(
+        (Number(bill.subtotal) || 0) -
+            (Number(bill.pickup_charges) || 0) -
+            (Number(bill.drop_charges) || 0) -
+            (Number(bill.towing_charge) || 0)
+    );
+    const rebuiltAmount = round2(serviceRows.reduce((sum, line) => sum + line.total, 0));
+    if (rebuiltAmount !== billedServiceAmount) return bill;
+
+    const transportRows = (bill.services || [])
+        .filter((row) => TRANSPORT_ROW_NAMES.has(row.name))
+        .map((row) => ({ name: row.name, price: row.price, quantity: row.quantity, total: row.total }));
+    const next = [...serviceRows, ...transportRows];
+
+    const current = (bill.services || []).map((row) => `${row.name}|${round2(row.total)}`);
+    const rebuilt = next.map((row) => `${row.name}|${round2(row.total)}`);
+    if (current.length === rebuilt.length && current.every((row, i) => row === rebuilt[i])) {
+        return bill;
+    }
+
+    await Bill.updateOne({ _id: bill._id }, { $set: { services: next } });
+    bill.services = next;
     return bill;
 }
 
@@ -452,5 +522,6 @@ module.exports = {
     generateInvoiceNumber,
     getOrCreateInvoice,
     backfillBikeRegistration,
+    refreshBillServiceLines,
     buildInvoiceResponse,
 };

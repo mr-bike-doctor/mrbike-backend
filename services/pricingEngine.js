@@ -113,22 +113,28 @@ function round2(n) {
 }
 
 /**
- * Resolve the price of a single AdminService/additional-service document for
- * a bike. Legacy callers may supply only CC; bike-aware callers must also pass
- * model/variant IDs so another variant with the same engine size cannot lend
- * its price to the selected bike.
+ * Find the price row of a single AdminService/additional-service document
+ * that applies to a bike, or null when the dealer has priced it for no row
+ * this bike qualifies for. Legacy callers may supply only CC; bike-aware
+ * callers must also pass model/variant IDs so another variant with the same
+ * engine size cannot lend its price to the selected bike.
  */
-function resolvePriceForCC(doc, bikeCC, bikeContext = null) {
-  if (!doc || !Array.isArray(doc.bikes)) return 0;
+function findPriceRowForCC(doc, bikeCC, bikeContext = null) {
+  if (!doc || !Array.isArray(doc.bikes)) return null;
   const cc = Number(bikeCC);
-  const ccMatches = doc.bikes.filter(
-    (row) => Number(row.cc) === cc && Number.isFinite(Number(row.price))
-  );
+  const priced = doc.bikes.filter((row) => Number.isFinite(Number(row.price)));
+  // Exact CC first. Rows and bikes have historically disagreed on decimals
+  // (a 109.7cc variant priced at 109.7 but read back as parseInt → 109, or
+  // the other way round), so a whole-number match is the fallback.
+  let ccMatches = priced.filter((row) => Number(row.cc) === cc);
+  if (ccMatches.length === 0 && Number.isFinite(cc) && cc > 0) {
+    ccMatches = priced.filter((row) => Math.trunc(Number(row.cc)) === Math.trunc(cc));
+  }
 
   // Keep old non-bike-aware integrations working, while all user booking
   // paths below provide the selected variant context.
   if (!bikeContext) {
-    return ccMatches.length ? Number(ccMatches[0].price) || 0 : 0;
+    return ccMatches[0] || null;
   }
 
   const variantId = bikeContext.variantId || bikeContext.variant_id;
@@ -144,7 +150,24 @@ function resolvePriceForCC(doc, bikeCC, bikeContext = null) {
     const specificity = (row) => Number(Boolean(row.variant_id)) + Number(Boolean(row.model_id));
     return specificity(b) - specificity(a) || Number(a.price) - Number(b.price);
   });
-  return matches.length ? Number(matches[0].price) || 0 : 0;
+  return matches[0] || null;
+}
+
+/** Price of that row, or 0 when none applies. */
+function resolvePriceForCC(doc, bikeCC, bikeContext = null) {
+  const row = findPriceRowForCC(doc, bikeCC, bikeContext);
+  return row ? Number(row.price) || 0 : 0;
+}
+
+/**
+ * The CC a bike is priced against: the variant's engine_cc, else the
+ * denormalized UserBike.bike_cc. parseFloat (not parseInt) so a decimal
+ * engine_cc still matches its rows exactly; findPriceRowForCC falls back to
+ * a whole-number match either way.
+ */
+function resolveBikeCC(userBike) {
+  const cc = parseFloat(userBike?.variant_id?.engine_cc || userBike?.bike_cc || 0);
+  return Number.isFinite(cc) ? cc : 0;
 }
 
 /**
@@ -154,10 +177,23 @@ function resolvePriceForCC(doc, bikeCC, bikeContext = null) {
  * controller/payment.js.
  */
 function resolveServiceAmount({ services = [], additionalServices = [], bikeCC, bikeContext = null }) {
-  let amount = 0;
-  for (const svc of services) amount += resolvePriceForCC(svc, bikeCC, bikeContext);
-  for (const svc of additionalServices) amount += resolvePriceForCC(svc, bikeCC, bikeContext);
-  return round2(amount);
+  const lines = resolveServiceLines({ services, additionalServices, bikeCC, bikeContext });
+  return round2(lines.reduce((sum, line) => sum + line.price, 0));
+}
+
+/**
+ * The same prices, one row per service, in booking order: main services
+ * first, then additional ones. Stored on the booking as `serviceLines` so the
+ * invoice and the apps can show what each service was actually charged at,
+ * instead of re-pricing it later against a catalog that may have moved.
+ */
+function resolveServiceLines({ services = [], additionalServices = [], bikeCC, bikeContext = null }) {
+  const line = (kind) => (doc) => ({
+    kind,
+    ref: doc?._id || null,
+    price: round2(resolvePriceForCC(doc, bikeCC, bikeContext)),
+  });
+  return [...services.map(line("service")), ...additionalServices.map(line("additional"))];
 }
 
 /**
@@ -608,6 +644,7 @@ const PRICING_SNAPSHOT_FIELDS = Object.freeze([
   "discountAmount",
   "pricingVersion",
   "priceSnapshotAt",
+  "serviceLines",
   // Promo code snapshot — set once at creation via applyBreakdownToBooking()
   // when a promo was supplied; immutable for the same reason as every other
   // field here (a promo can't be swapped after the customer saw the price).
@@ -639,7 +676,11 @@ const PRICING_WRITE_BYPASS_FLAG = "allowPricingWrite";
  * the guard already allows first-save writes — but calling it keeps every
  * write site consistent.
  */
-function applyBreakdownToBooking(bookingDoc, breakdown) {
+function applyBreakdownToBooking(bookingDoc, breakdown, { serviceLines } = {}) {
+  // Per-service prices behind `serviceAmount` (resolveServiceLines). Optional
+  // so a caller that only has the total keeps whatever lines are already
+  // stored — but every caller that re-prices the service list passes them.
+  if (Array.isArray(serviceLines)) bookingDoc.serviceLines = serviceLines;
   bookingDoc.transportOption = breakdown.transportOption;
   bookingDoc.serviceAmount = breakdown.serviceAmount;
   bookingDoc.pickupCharges = breakdown.pickupCharges;
@@ -731,8 +772,11 @@ module.exports = {
   PRICING_SNAPSHOT_FIELDS,
   PRICING_WRITE_BYPASS_FLAG,
   round2,
+  findPriceRowForCC,
   resolvePriceForCC,
+  resolveBikeCC,
   resolveServiceAmount,
+  resolveServiceLines,
   computeTransportCharges,
   normalizeBikeCondition,
   isTowingRequired,

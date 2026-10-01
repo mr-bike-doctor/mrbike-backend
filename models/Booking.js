@@ -333,6 +333,22 @@ const bookingSchema = new mongoose.Schema(
     discountAmount: { type: Number, default: 0 },
     pricingVersion: { type: Number, default: null },
     priceSnapshotAt: { type: Date, default: null },
+    // What each service inside `serviceAmount` was priced at, written with
+    // the rest of the snapshot (pricingEngine#resolveServiceLines). `ref` is
+    // the AdminService (kind "service") or AdditionalService ("additional")
+    // id. Empty on bookings priced before this existed; the invoice then
+    // re-prices the services with the same resolver.
+    serviceLines: {
+      type: [
+        {
+          _id: false,
+          kind: { type: String, enum: ["service", "additional"] },
+          ref: { type: mongoose.Schema.Types.ObjectId, default: null },
+          price: { type: Number, default: 0 },
+        },
+      ],
+      default: [],
+    },
 
     // ── Promo Code snapshot ────────────────────────────────────────────────
     // Set once at booking creation via pricingEngine.applyBreakdownToBooking()
