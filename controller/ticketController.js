@@ -1,6 +1,8 @@
 const mongoose = require("mongoose")
 const Ticket = require("../models/ticket_model")
 const Admin = require("../models/admin_model")
+const Customer = require("../models/customer_model")
+const Vendor = require("../models/dealerModel")
 
 const parseTicketNo = (s) => {
   const str = String(s || "").trim()
@@ -15,6 +17,69 @@ const parseTicketNo = (s) => {
 const getActiveAdminIds = async () => {
   const admins = await Admin.find({ status: "active" }).select("_id").lean()
   return admins.map((a) => a._id)
+}
+
+// Tickets only store user_id + user_type, so the admin console had no way to
+// tell who raised a ticket. Resolves each ticket's raiser from the matching
+// collection (customers for "user", Vendor for "dealer") and attaches a small
+// `raisedBy` summary. Admin-only — never sent back to customers/dealers.
+const isDealerType = (t) => t === "dealer" || Number(t) === 2
+
+const attachRaisedBy = async (tickets) => {
+  const customerIds = []
+  const dealerIds = []
+  tickets.forEach((t) => {
+    if (!t?.user_id) return
+    ;(isDealerType(t.user_type) ? dealerIds : customerIds).push(t.user_id)
+  })
+
+  const [customers, dealers] = await Promise.all([
+    customerIds.length
+      ? Customer.find({ _id: { $in: customerIds } }).select("id first_name last_name phone email city").lean()
+      : [],
+    dealerIds.length
+      ? Vendor.find({ _id: { $in: dealerIds } })
+          .select("id shopName ownerName phone shopContact email shopEmail city")
+          .lean()
+      : [],
+  ])
+
+  const customerMap = new Map(customers.map((c) => [String(c._id), c]))
+  const dealerMap = new Map(dealers.map((d) => [String(d._id), d]))
+
+  return tickets.map((t) => {
+    const key = String(t.user_id)
+    let raisedBy = null
+    if (isDealerType(t.user_type)) {
+      const d = dealerMap.get(key)
+      if (d) {
+        raisedBy = {
+          _id: d._id,
+          type: "dealer",
+          displayId: d.id ?? null,
+          name: d.shopName || d.ownerName || "",
+          ownerName: d.ownerName || "",
+          phone: d.phone || d.shopContact || "",
+          email: d.email || d.shopEmail || "",
+          city: d.city || "",
+        }
+      }
+    } else {
+      const c = customerMap.get(key)
+      if (c) {
+        raisedBy = {
+          _id: c._id,
+          type: "user",
+          displayId: c.id ?? null,
+          name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+          phone: c.phone || "",
+          email: c.email || "",
+          city: c.city || "",
+        }
+      }
+    }
+    return { ...t, raisedBy }
+  })
 }
 
 // req.auth.role comes from authenticateActor ("customer"/"dealer"), while
@@ -267,10 +332,12 @@ const getAllUserAndDealerTickets = async (req, res) => {
     // Collapse the raw unreadFor map down to a single boolean scoped to the
     // requesting admin — the client only needs to know "unread for me".
     const adminId = req.admin_id ? String(req.admin_id) : null
-    const rows = tickets.map(({ unreadFor, ...t }) => ({
-      ...t,
-      unread: Boolean(adminId && unreadFor && unreadFor[adminId] > 0),
-    }))
+    const rows = await attachRaisedBy(
+      tickets.map(({ unreadFor, ...t }) => ({
+        ...t,
+        unread: Boolean(adminId && unreadFor && unreadFor[adminId] > 0),
+      })),
+    )
 
     return res.status(200).json({
       success: true,
@@ -429,11 +496,13 @@ const getTicketById = async (req, res) => {
     const timeStr = `${day}${month}${year}${hours}${minutes}`
     const prefix = ticket.user_type === "dealer" ? "MRBD" : "MRBDC"
 
+    const payload = req.auth?.role === "admin" ? (await attachRaisedBy([ticket]))[0] : ticket
+
     return res.status(200).json({
       success: true,
       message: "Ticket retrieved successfully",
       data: {
-        ...ticket,
+        ...payload,
         ticketId: `${prefix}${timeStr}`,
       },
     })
