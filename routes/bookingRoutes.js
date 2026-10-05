@@ -26,6 +26,7 @@ const {
     addNoteToBooking,
     updateBookings,
     editCompletedBooking,
+    getBookingAdditionalServiceOptions,
     sendOtpToMobile,
     verifyOtpForMobile,
     cancelBooking,
@@ -134,6 +135,8 @@ router.get('/:bookingId/completion-photos', requireBookingParticipant(req => req
 router.delete('/:bookingId/completion-photos/:photoId', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), deleteCompletionPhoto);
 // Edit services / odometer / notes between Complete Service and delivery.
 // Rules: services/postServiceEdit.js. Dealer-only — the owning garage.
+// Catalog priced by the server for this booking's bike (bookingPrice, null = unpriced).
+router.get('/:bookingId/additional-service-options', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), getBookingAdditionalServiceOptions);
 router.post('/:bookingId/post-service-edit', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), editCompletedBooking);
 router.post('/:bookingId/select-payment-method', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), selectPaymentMethod);
 router.post('/:bookingId/confirm-cash-received', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), confirmCashReceived);

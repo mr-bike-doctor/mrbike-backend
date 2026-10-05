@@ -3810,6 +3810,65 @@ const pricingFieldsOf = (doc) => ({
   tax: doc.tax,
 });
 
+/**
+ * GET /bookings/:bookingId/additional-service-options   (dealer only)
+ *
+ * The garage's active additional services, each with the price the server
+ * will actually charge for THIS booking's bike (`bookingPrice`), resolved by
+ * the same findPriceRowForCC() + bike context that re-pricing uses. Services
+ * with no price row for this bike (priced only for another CC / model /
+ * variant) are not returned at all, so the app never offers one the save
+ * would reject.
+ */
+async function getBookingAdditionalServiceOptions(req, res) {
+  try {
+    const { bookingId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id" });
+    }
+    const existingBooking = await booking
+      .findOne({ _id: bookingId, dealer_id: req.user_id })
+      .select("dealer_id userBike_id");
+    if (!existingBooking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const [bikeData, docs] = await Promise.all([
+      UserBike.findById(existingBooking.userBike_id)
+        .select("bike_cc variant_id")
+        .populate({ path: "variant_id", select: "model_id engine_cc" }),
+      AdditionalService.find({ dealer_id: existingBooking.dealer_id, isActive: { $ne: false } })
+        .populate("base_additional_service_id", "name image description")
+        .sort({ id: -1 })
+        .lean(),
+    ]);
+
+    const bikeCC = resolveBikeCC(bikeData);
+    const bikeContext = {
+      variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
+      modelId: bikeData?.variant_id?.model_id,
+    };
+
+    // Only services this garage has priced for THIS bike are offered. A
+    // service priced for another CC / model / variant is left out entirely —
+    // it can't be charged on this booking, so it must not be pickable.
+    const data = docs
+      .map((doc) => ({ doc, row: findPriceRowForCC(doc, bikeCC, bikeContext) }))
+      .filter(({ row }) => row)
+      .map(({ doc, row }) => ({
+        ...doc,
+        // Only the row that applies — never another bike's price.
+        bikes: [row],
+        bookingPrice: round2(Number(row.price) || 0),
+      }));
+
+    return res.status(200).json({ success: true, bikeCC, data });
+  } catch (error) {
+    console.error("[ADDITIONAL-SERVICE-OPTIONS] Error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+}
+
 async function editCompletedBooking(req, res) {
   let lockToken = null;
   const { bookingId } = req.params;
@@ -4308,6 +4367,7 @@ module.exports = {
   updateBooking,
   updateTowingCharge,
   editCompletedBooking,
+  getBookingAdditionalServiceOptions,
   updateBookingStatus,
   sendBookingOTP,
   verifyBookingOTP,

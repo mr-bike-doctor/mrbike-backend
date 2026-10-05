@@ -72,11 +72,14 @@ const Payment = require("../models/Payment");
 require("../models/customer_model");
 require("../models/baseAdditionalServiceSchema");
 const { computePriceBreakdown, applyBreakdownToBooking } = require("../services/pricingEngine");
-const { editCompletedBooking } = require("../controller/booking");
+const { editCompletedBooking, getBookingAdditionalServiceOptions } = require("../controller/booking");
 
 const id = (n) => new mongoose.Types.ObjectId(String(n).padStart(24, "0"));
 const DEALER = id(1), OTHER_DEALER = id(2), USER = id(3), BIKE = id(4);
 const MAIN = id(10), BELT = id(11), OIL = id(12), FOREIGN = id(13), UNPRICED = id(14), INACTIVE = id(15);
+// Priced only for some other bike MODEL — the case that showed ₹150 in the
+// app's picker but was refused on save.
+const MODEL_SCOPED = id(16), OTHER_MODEL = id(77);
 
 function call(bookingId, body, dealerId = DEALER) {
   const captured = {};
@@ -117,6 +120,7 @@ async function seed() {
     addl(FOREIGN, { dealer_id: OTHER_DEALER }),
     addl(UNPRICED, { bikes: [{ cc: 150, price: 999 }] }),
     addl(INACTIVE, { isActive: false }),
+    addl(MODEL_SCOPED, { bikes: [{ cc: 125, price: 150, model_id: OTHER_MODEL }] }),
   ]);
 }
 
@@ -188,6 +192,32 @@ async function run() {
   const removed = await call(b1._id, { services: [] });
   assert.strictEqual(removed.code, 200);
   assert.strictEqual((await Booking.findById(b1._id)).amountDue, before);
+
+  // ── Server-priced catalog for this booking's bike ────────────────────────
+  const options = await new Promise((resolve) => {
+    const captured = {};
+    const res = {
+      status(code) { captured.code = code; return this; },
+      json(payload) { captured.body = payload; resolve(captured); return this; },
+    };
+    getBookingAdditionalServiceOptions(
+      { params: { bookingId: String(b1._id) }, user_id: String(DEALER), auth: { role: "dealer" } },
+      res
+    );
+  });
+  assert.strictEqual(options.code, 200);
+  const priceById = Object.fromEntries(options.body.data.map((d) => [String(d._id), d.bookingPrice]));
+  assert.strictEqual(priceById[String(BELT)], 200);
+  assert.strictEqual(priceById[String(OIL)], 300);
+  assert.ok(!(String(UNPRICED) in priceById), "a service priced only for another CC is not listed");
+  assert.ok(!(String(MODEL_SCOPED) in priceById), "a service priced only for another model is not listed");
+  for (const d of options.body.data) assert.strictEqual(d.bikes.length, 1);
+  assert.ok(!(String(FOREIGN) in priceById), "other garages' services are not listed");
+  assert.ok(!(String(INACTIVE) in priceById), "inactive services are not listed");
+  // …and the save agrees with it.
+  const modelScoped = await call(b1._id, { services: [String(MODEL_SCOPED)] });
+  assert.strictEqual(modelScoped.body.code, "ADDITIONAL_SERVICE_UNPRICED");
+  assert.deepStrictEqual(modelScoped.body.unpriced, [String(MODEL_SCOPED)]);
 
   // ── Catalog guards ───────────────────────────────────────────────────────
   for (const [svc, code] of [
