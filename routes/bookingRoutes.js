@@ -25,6 +25,7 @@ const {
     getNotesFromBooking,
     addNoteToBooking,
     updateBookings,
+    editCompletedBooking,
     sendOtpToMobile,
     verifyOtpForMobile,
     cancelBooking,
@@ -131,6 +132,9 @@ router.post('/:bookingId/service-complete', requireBookingParticipant(req => req
 router.post('/:bookingId/completion-photos', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), handleCompletionPhotoUpload, uploadCompletionPhotos);
 router.get('/:bookingId/completion-photos', requireBookingParticipant(req => req.params.bookingId), requireActorRoleAny("dealer", "admin"), getCompletionPhotos);
 router.delete('/:bookingId/completion-photos/:photoId', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), deleteCompletionPhoto);
+// Edit services / odometer / notes between Complete Service and delivery.
+// Rules: services/postServiceEdit.js. Dealer-only — the owning garage.
+router.post('/:bookingId/post-service-edit', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), editCompletedBooking);
 router.post('/:bookingId/select-payment-method', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), selectPaymentMethod);
 router.post('/:bookingId/confirm-cash-received', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), confirmCashReceived);
 router.post('/verify-delivery-otp', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), verifyDeliveryOtp);

@@ -14,7 +14,19 @@ const { handleBookingCompletion } = require("../controller/reward")
 const { generateBill } = require("../controller/payment")
 const { getOrCreateInvoice } = require("../services/invoiceService")
 const { settleBookingWallet } = require("../helper/walletSettlement")
-const { cancelPendingPaymentSessions } = require("../helper/paymentSession")
+const {
+  cancelPendingPaymentSessions,
+  acquirePaymentOrderLock,
+  releasePaymentOrderLock,
+} = require("../helper/paymentSession")
+const {
+  PostServiceEditError,
+  resolvePostServiceEditWindow,
+  normalizeOdometer,
+  normalizeNotes,
+  diffIds,
+  sameNotes,
+} = require("../services/postServiceEdit")
 const { deleteS3Object } = require("../utils/s3Upload")
 const UserBike = require("../models/userBikeModel");
 const AdminService = require("../models/adminService");
@@ -36,6 +48,7 @@ const {
   PricingError,
   resolveBikeCC,
   findPriceRowForCC,
+  PRICING_WRITE_BYPASS_FLAG,
 } = require("../services/pricingEngine");
 const { getPricingSettings } = require("../services/appSettingsService");
 const { validatePromoCode } = require("../services/promoService");
@@ -1351,6 +1364,109 @@ const UPDATE_BOOKING_ALLOWED_FIELDS = [
   "pickupStatus",
 ];
 
+class RepriceError extends Error {
+  constructor(status, body) {
+    super(body?.message || "Could not re-price booking");
+    this.status = status;
+    this.body = { success: false, ...body };
+  }
+}
+
+/**
+ * Re-price a loaded (unsaved) booking for its CURRENT `services` +
+ * `additionalServices` and write a fresh pricing snapshot onto it via
+ * pricingEngine.applyBreakdownToBooking(). The caller saves.
+ *
+ * Everything already agreed on the booking is frozen: the reward/coupon
+ * discount, the towing charge, the platform fee and the commission tax rate
+ * are replayed from the booking rather than re-read from the dealer's or
+ * admin's current settings.
+ *
+ * `addedAdditionalIds` are the ids newly added on this edit. Only those are
+ * checked for a price row for this bike — one already on the booking is left
+ * alone. Throws RepriceError (status + JSON body) for any client-facing
+ * refusal.
+ */
+async function repriceAdditionalServices(existingBooking, addedAdditionalIds = []) {
+  const [dealer, bikeData, mainDocs, addlDocs] = await Promise.all([
+    Vendor.findById(existingBooking.dealer_id)
+      .select("tax commission pickupCharges dropCharges providesPickup providesDrop providesTowing towingCharges")
+      .lean(),
+    UserBike.findById(existingBooking.userBike_id)
+      .select("bike_cc variant_id")
+      .populate({ path: "variant_id", select: "model_id engine_cc" }),
+    AdminService.find({ _id: { $in: existingBooking.services } }).select("bikes"),
+    AdditionalService.find({ _id: { $in: existingBooking.additionalServices } })
+      .select("bikes base_additional_service_id")
+      .populate("base_additional_service_id", "name"),
+  ]);
+
+  if (!dealer) {
+    throw new RepriceError(404, { message: "Dealer not found for this booking" });
+  }
+
+  const bikeCC = resolveBikeCC(bikeData);
+  const bikeContext = {
+    variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
+    modelId: bikeData?.variant_id?.model_id,
+  };
+
+  // An additional service with no price row for THIS bike would be priced
+  // at ₹0 by resolveServiceAmount — it would show on the job and the
+  // invoice while never being charged. Refuse it instead, so the garage
+  // knows the price has to be set for this bike first.
+  const addedSet = new Set(addedAdditionalIds.map(String));
+  const unpriced = addlDocs.filter(
+    (doc) => addedSet.has(String(doc._id)) && !findPriceRowForCC(doc, bikeCC, bikeContext)
+  );
+  if (unpriced.length > 0) {
+    const names = unpriced
+      .map((doc) => doc.base_additional_service_id?.name || "Additional service")
+      .join(", ");
+    throw new RepriceError(400, {
+      message: `${names}: no price is set for this bike. Ask MR Bike to add a price for this bike before adding the service.`,
+      code: "ADDITIONAL_SERVICE_UNPRICED",
+      unpriced: unpriced.map((doc) => String(doc._id)),
+    });
+  }
+
+  const pricingInput = { services: mainDocs, additionalServices: addlDocs, bikeCC, bikeContext };
+  const serviceLines = resolveServiceLines(pricingInput);
+  const serviceAmount = resolveServiceAmount(pricingInput);
+
+  let breakdown;
+  try {
+    breakdown = computePriceBreakdown({
+      serviceAmount,
+      transportOption: existingBooking.transportOption,
+      dealer,
+      // Preserve any reward/coupon discount already applied to this booking.
+      discountAmount: existingBooking.discountAmount,
+      // …and the towing charge already agreed on this booking. Passing the
+      // booking's own value as the override keeps it frozen here: changing
+      // the service list must not silently re-derive towing from the
+      // dealer's current rate, nor drop a charge the dealer already set.
+      bikeCondition: existingBooking.bikeCondition,
+      towingRequiredOverride: existingBooking.towingRequired,
+      towingChargeOverride: existingBooking.towingCharge,
+      // …and the platform fee this booking was created with, for the same
+      // reason: a service-list edit must not pull in the admin's current
+      // fee, nor drop one the customer has already agreed to.
+      platformFeeOverride: existingBooking.platformFee,
+      platformFeeLabelOverride: existingBooking.platformFeeLabel,
+      commissionTaxRateOverride: existingBooking.commissionTaxRate,
+    });
+  } catch (pricingError) {
+    if (pricingError instanceof PricingError) {
+      throw new RepriceError(400, { message: pricingError.message, code: pricingError.code });
+    }
+    throw pricingError;
+  }
+
+  applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
+  return breakdown;
+}
+
 async function updateBooking(req, res) {
   try {
     const { bookingId, ...updateFields } = req.body;
@@ -1479,84 +1595,14 @@ async function updateBooking(req, res) {
     // --- service list changed: resolve services -> pricingEngine.computePriceBreakdown()
     // -> update ALL pricing snapshot fields together. Never touch totalBill alone. ---
     if (additionalServicesChanged) {
-      const [dealer, bikeData, mainDocs, addlDocs] = await Promise.all([
-        Vendor.findById(existingBooking.dealer_id)
-          .select("tax commission pickupCharges dropCharges providesPickup providesDrop providesTowing towingCharges")
-          .lean(),
-        UserBike.findById(existingBooking.userBike_id)
-          .select("bike_cc variant_id")
-          .populate({ path: "variant_id", select: "model_id engine_cc" }),
-        AdminService.find({ _id: { $in: existingBooking.services } }).select("bikes"),
-        AdditionalService.find({ _id: { $in: existingBooking.additionalServices } })
-          .select("bikes base_additional_service_id")
-          .populate("base_additional_service_id", "name"),
-      ]);
-
-      if (!dealer) {
-        return res.status(404).json({ success: false, message: "Dealer not found for this booking" });
-      }
-
-      const bikeCC = resolveBikeCC(bikeData);
-      const bikeContext = {
-        variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
-        modelId: bikeData?.variant_id?.model_id,
-      };
-
-      // An additional service with no price row for THIS bike would be priced
-      // at ₹0 by resolveServiceAmount — it would show on the job and the
-      // invoice while never being charged. Refuse it instead, so the garage
-      // knows the price has to be set for this bike first. Only newly added
-      // services are checked; one already on the booking is left alone.
-      const addedSet = new Set(addedAdditionalIds);
-      const unpriced = addlDocs.filter(
-        (doc) => addedSet.has(String(doc._id)) && !findPriceRowForCC(doc, bikeCC, bikeContext)
-      );
-      if (unpriced.length > 0) {
-        const names = unpriced
-          .map((doc) => doc.base_additional_service_id?.name || "Additional service")
-          .join(", ");
-        return res.status(400).json({
-          success: false,
-          message: `${names}: no price is set for this bike. Ask MR Bike to add a price for this bike before adding the service.`,
-          code: "ADDITIONAL_SERVICE_UNPRICED",
-          unpriced: unpriced.map((doc) => String(doc._id)),
-        });
-      }
-
-      const pricingInput = { services: mainDocs, additionalServices: addlDocs, bikeCC, bikeContext };
-      const serviceLines = resolveServiceLines(pricingInput);
-      const serviceAmount = resolveServiceAmount(pricingInput);
-
-      let breakdown;
       try {
-        breakdown = computePriceBreakdown({
-          serviceAmount,
-          transportOption: existingBooking.transportOption,
-          dealer,
-          // Preserve any reward/coupon discount already applied to this booking.
-          discountAmount: existingBooking.discountAmount,
-          // …and the towing charge already agreed on this booking. Passing the
-          // booking's own value as the override keeps it frozen here: changing
-          // the service list must not silently re-derive towing from the
-          // dealer's current rate, nor drop a charge the dealer already set.
-          bikeCondition: existingBooking.bikeCondition,
-          towingRequiredOverride: existingBooking.towingRequired,
-          towingChargeOverride: existingBooking.towingCharge,
-          // …and the platform fee this booking was created with, for the same
-          // reason: a service-list edit must not pull in the admin's current
-          // fee, nor drop one the customer has already agreed to.
-          platformFeeOverride: existingBooking.platformFee,
-          platformFeeLabelOverride: existingBooking.platformFeeLabel,
-          commissionTaxRateOverride: existingBooking.commissionTaxRate,
-        });
-      } catch (pricingError) {
-        if (pricingError instanceof PricingError) {
-          return res.status(400).json({ success: false, message: pricingError.message, code: pricingError.code });
+        await repriceAdditionalServices(existingBooking, addedAdditionalIds);
+      } catch (repriceError) {
+        if (repriceError instanceof RepriceError) {
+          return res.status(repriceError.status).json(repriceError.body);
         }
-        throw pricingError;
+        throw repriceError;
       }
-
-      applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
     }
 
     await existingBooking.save();
@@ -3713,6 +3759,362 @@ async function updateTowingCharge(req, res) {
   }
 }
 
+/* ======================================================================
+   EDIT A COMPLETED BOOKING  (Complete Service → delivery)
+   ----------------------------------------------------------------------
+   POST /bookings/:bookingId/post-service-edit        (dealer only)
+   Body (every field optional, at least one required):
+     services       full list of AdditionalService ids (REPLACES the list)
+     lastServiceKm  odometer reading; '' / null clears it
+     notes          full list of dealer notes (REPLACES the list)
+     dryRun         true → validate + re-price, return the preview, save nothing
+
+   The edit window and what each stage allows lives in
+   services/postServiceEdit.js. In short: services only while the customer
+   still owes the money; odometer + notes until the bike is delivered.
+
+   Money safety:
+     • Pricing goes through repriceAdditionalServices() — the same
+       pricingEngine path as Complete Service — never a patched total.
+     • If the dealer had already picked a payment method (payment_selected),
+       the method was chosen for the OLD amount: any live PayU QR is cancelled
+       at PayU (refused if PayU says it was already paid) and the booking goes
+       back to awaiting_payment so the dealer collects the new amount. The
+       payment-order lock is held meanwhile so no QR can be minted mid-edit.
+     • The write is conditional on status / payment state being unchanged
+       since this request read the booking, so a cash confirmation or QR
+       payment that lands at the same moment can never be overwritten.
+====================================================================== */
+const MAX_ADDITIONAL_SERVICES_PER_BOOKING = 30;
+
+const pricingFieldsOf = (doc) => ({
+  serviceAmount: doc.serviceAmount,
+  serviceLines: doc.serviceLines,
+  pickupCharges: doc.pickupCharges,
+  dropCharges: doc.dropCharges,
+  towingCharge: doc.towingCharge,
+  subtotal: doc.subtotal,
+  taxRate: doc.taxRate,
+  taxAmount: doc.taxAmount,
+  platformFee: doc.platformFee,
+  platformFeeLabel: doc.platformFeeLabel,
+  discountAmount: doc.discountAmount,
+  customerTotal: doc.customerTotal,
+  amountDue: doc.amountDue,
+  commissionRate: doc.commissionRate,
+  commissionAmount: doc.commissionAmount,
+  commissionTaxRate: doc.commissionTaxRate,
+  commissionTaxAmount: doc.commissionTaxAmount,
+  dealerEarnings: doc.dealerEarnings,
+  totalBill: doc.totalBill,
+  tax: doc.tax,
+});
+
+async function editCompletedBooking(req, res) {
+  let lockToken = null;
+  const { bookingId } = req.params;
+  try {
+    const body = req.body || {};
+    const has = (key) => Object.prototype.hasOwnProperty.call(body, key);
+    const dryRun = body.dryRun === true;
+
+    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id" });
+    }
+    if (!has("services") && !has("lastServiceKm") && !has("notes")) {
+      return res.status(400).json({
+        success: false,
+        message: "Nothing to update. Send services, lastServiceKm or notes.",
+        code: "NOTHING_TO_UPDATE",
+      });
+    }
+
+    const existingBooking = await booking.findOne({ _id: bookingId, dealer_id: req.user_id });
+    if (!existingBooking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    const editWindow = resolvePostServiceEditWindow(existingBooking);
+    if (!editWindow.canEdit) {
+      return res.status(409).json({ success: false, message: editWindow.reason, code: editWindow.code, editWindow });
+    }
+
+    // ── Validate every input before touching the document ──────────────────
+    let nextKm;
+    let nextNotes;
+    try {
+      if (has("lastServiceKm")) nextKm = normalizeOdometer(body.lastServiceKm);
+      if (has("notes")) nextNotes = normalizeNotes(body.notes);
+    } catch (validationError) {
+      if (validationError instanceof PostServiceEditError) {
+        return res.status(validationError.status).json({
+          success: false,
+          message: validationError.message,
+          code: validationError.code,
+        });
+      }
+      throw validationError;
+    }
+
+    const previousIds = (existingBooking.additionalServices || []).map(String);
+    let nextIds = previousIds;
+    if (has("services")) {
+      if (!Array.isArray(body.services)) {
+        return res.status(400).json({
+          success: false,
+          message: "`services` must be an array of additional service ids",
+          code: "INVALID_SERVICES",
+        });
+      }
+      const invalid = body.services.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+      if (invalid.length) {
+        return res.status(400).json({ success: false, message: "Invalid service id(s) provided", code: "INVALID_SERVICES", invalid });
+      }
+      nextIds = [...new Set(body.services.map(String))];
+      if (nextIds.length > MAX_ADDITIONAL_SERVICES_PER_BOOKING) {
+        return res.status(400).json({
+          success: false,
+          message: `A booking can hold up to ${MAX_ADDITIONAL_SERVICES_PER_BOOKING} additional services.`,
+          code: "INVALID_SERVICES",
+        });
+      }
+    }
+
+    const { added, removed } = diffIds(previousIds, nextIds);
+    const servicesChanged = added.length > 0 || removed.length > 0;
+    const previousKm = Number(existingBooking.lastServiceKm || 0);
+    const kmChanged = nextKm !== undefined && nextKm !== previousKm;
+    const previousNotes = [...(existingBooking.additionalNotes || [])];
+    const notesChanged = nextNotes !== undefined && !sameNotes(previousNotes, nextNotes);
+
+    if (servicesChanged && !editWindow.canEditServices) {
+      return res.status(409).json({ success: false, message: editWindow.reason, code: editWindow.code, editWindow });
+    }
+
+    // Newly added services must be this garage's own, active catalog entries.
+    // (Services already on the booking are kept even if since deactivated.)
+    if (added.length > 0) {
+      const ownActive = await AdditionalService.find({
+        _id: { $in: added },
+        dealer_id: existingBooking.dealer_id,
+        isActive: { $ne: false },
+      })
+        .select("_id")
+        .lean();
+      const ownIds = new Set(ownActive.map((doc) => String(doc._id)));
+      const notAllowed = added.filter((id) => !ownIds.has(id));
+      if (notAllowed.length) {
+        return res.status(400).json({
+          success: false,
+          message: "Some services are not available in your catalog",
+          code: "SERVICE_NOT_IN_CATALOG",
+          invalid: notAllowed,
+        });
+      }
+    }
+
+    const originalState = {
+      status: existingBooking.status,
+      payment_status: existingBooking.payment_status,
+      billStatus: existingBooking.billStatus,
+      payment_method: existingBooking.payment_method,
+    };
+    const previousAmountDue = existingBooking.amountDue;
+
+    // ── Apply to the in-memory document ────────────────────────────────────
+    if (servicesChanged) {
+      existingBooking.additionalServices = nextIds.map((id) => new mongoose.Types.ObjectId(id));
+      try {
+        await repriceAdditionalServices(existingBooking, added);
+      } catch (repriceError) {
+        if (repriceError instanceof RepriceError) {
+          return res.status(repriceError.status).json(repriceError.body);
+        }
+        throw repriceError;
+      }
+    }
+    if (kmChanged) existingBooking.lastServiceKm = nextKm;
+    if (notesChanged) existingBooking.additionalNotes = nextNotes;
+
+    const newAmountDue = existingBooking.amountDue;
+    const amountChanged = Math.abs(round2(newAmountDue - previousAmountDue)) >= 0.01;
+    // Any service-list change while a method is already chosen voids that
+    // choice: the QR / cash expectation was set up for the old bill.
+    const willResetPayment = servicesChanged && originalState.status === "payment_selected";
+
+    const summary = {
+      servicesAdded: added,
+      servicesRemoved: removed,
+      servicesChanged,
+      kmChanged,
+      notesChanged,
+      amountChanged,
+      previousAmountDue,
+      newAmountDue,
+      paymentReset: willResetPayment,
+    };
+
+    if (!servicesChanged && !kmChanged && !notesChanged) {
+      return res.status(200).json({
+        success: true,
+        message: "No changes to save",
+        changed: false,
+        dryRun,
+        editWindow,
+        summary,
+        data: { bookingId: existingBooking._id, ...pricingFieldsOf(existingBooking) },
+      });
+    }
+
+    if (dryRun) {
+      return res.status(200).json({
+        success: true,
+        message: "Preview only — nothing was saved",
+        changed: true,
+        dryRun: true,
+        editWindow,
+        summary,
+        data: { bookingId: existingBooking._id, ...pricingFieldsOf(existingBooking) },
+      });
+    }
+
+    // ── Void the payment set up for the old amount ─────────────────────────
+    if (willResetPayment) {
+      lockToken = await acquirePaymentOrderLock(bookingId);
+      await cancelPendingPaymentSessions(bookingId, "bill_revised_after_service");
+      existingBooking.status = "awaiting_payment";
+      existingBooking.payment_method = null;
+    }
+
+    await existingBooking.validate();
+    const changes = existingBooking.getChanges();
+    const update = { ...changes };
+    update.$push = {
+      ...(update.$push || {}),
+      postServiceEdits: {
+        editedAt: new Date(),
+        editedBy: req.user_id || null,
+        editedByRole: req.auth?.role === "admin" ? "admin" : "dealer",
+        statusAtEdit: originalState.status,
+        servicesAdded: added,
+        servicesRemoved: removed,
+        previousAmountDue: servicesChanged ? previousAmountDue : null,
+        newAmountDue: servicesChanged ? newAmountDue : null,
+        previousLastServiceKm: kmChanged ? previousKm : null,
+        newLastServiceKm: kmChanged ? nextKm : null,
+        notesChanged,
+        paymentReset: willResetPayment,
+      },
+    };
+
+    // Conditional on nothing having moved since we read the booking. The
+    // pricing-guard bypass is passed ONLY when the snapshot was rebuilt by
+    // applyBreakdownToBooking() above — the same authorization save() gets.
+    const writeResult = await booking.updateOne(
+      {
+        _id: existingBooking._id,
+        dealer_id: existingBooking.dealer_id,
+        status: originalState.status,
+        payment_status: originalState.payment_status,
+        billStatus: originalState.billStatus,
+      },
+      update,
+      servicesChanged ? { [PRICING_WRITE_BYPASS_FLAG]: true } : {},
+    );
+    if (!writeResult.matchedCount) {
+      return res.status(409).json({
+        success: false,
+        message: "This booking was updated while you were editing (for example, payment was just received). Please reopen it and try again.",
+        code: "BOOKING_CHANGED",
+      });
+    }
+
+    console.log(
+      `[POST-SERVICE-EDIT] booking ${existingBooking.bookingId || bookingId}: ` +
+        `+${added.length}/-${removed.length} services, km ${kmChanged ? `${previousKm}→${nextKm}` : "unchanged"}, ` +
+        `notes ${notesChanged ? "changed" : "unchanged"}, amountDue ₹${previousAmountDue}→₹${newAmountDue}` +
+        (willResetPayment ? `, payment method ${originalState.payment_method} reset` : "")
+    );
+
+    // ── Tell the customer their bill changed ───────────────────────────────
+    if (amountChanged) {
+      try {
+        const user = await Customer.findById(existingBooking.user_id).select("device_token ftoken").lean();
+        const userToken = user?.device_token || user?.ftoken;
+        if (userToken) {
+          await sendBookingNotification({
+            token: userToken,
+            title: "Your bill was updated",
+            body: `The garage updated the services on your booking. New amount: ₹${round2(newAmountDue).toFixed(2)}.`,
+            data: { type: "bill_updated", bookingId: String(existingBooking._id) },
+            receiverId: existingBooking.user_id,
+            receiverType: "user",
+            bookingId: existingBooking._id,
+          });
+        }
+      } catch (notifyErr) {
+        console.error("[POST-SERVICE-EDIT] FCM error:", notifyErr.message);
+      }
+    }
+
+    const io = req.app.get("io");
+    if (io) {
+      const payload = {
+        bookingId: String(existingBooking._id),
+        status: existingBooking.status,
+        amountDue: newAmountDue,
+        amountChanged,
+        paymentReset: willResetPayment,
+      };
+      io.to(`user:${existingBooking.user_id}`).emit("booking:bill_updated", payload);
+      io.to(`dealer:${existingBooking.dealer_id}`).emit("booking:bill_updated", payload);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: willResetPayment
+        ? "Booking updated. The amount changed, so please collect payment again."
+        : "Booking updated successfully",
+      changed: true,
+      dryRun: false,
+      editWindow: resolvePostServiceEditWindow(existingBooking),
+      summary,
+      data: {
+        bookingId: existingBooking._id,
+        status: existingBooking.status,
+        payment_method: existingBooking.payment_method,
+        lastServiceKm: existingBooking.lastServiceKm,
+        additionalNotes: existingBooking.additionalNotes,
+        additionalServices: existingBooking.additionalServices,
+        ...pricingFieldsOf(existingBooking),
+      },
+    });
+  } catch (error) {
+    if (error.code === "PAYMENT_ORDER_LOCKED") {
+      return res.status(409).json({
+        success: false,
+        message: "A payment QR is being generated for this booking right now. Please try again in a moment.",
+        code: "PAYMENT_IN_PROGRESS",
+      });
+    }
+    if (error.code === "PAYMENT_ALREADY_PAID") {
+      return res.status(409).json({
+        success: false,
+        message: "The customer has already paid the current QR. Services can no longer be changed.",
+        code: "PAYMENT_ALREADY_COLLECTED",
+      });
+    }
+    console.error("[POST-SERVICE-EDIT] Error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  } finally {
+    if (lockToken) {
+      await releasePaymentOrderLock(bookingId, lockToken).catch((lockError) => {
+        console.error("[POST-SERVICE-EDIT] Failed to release payment order lock", { message: lockError.message });
+      });
+    }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -3905,6 +4307,7 @@ module.exports = {
   getBookingDetails,
   updateBooking,
   updateTowingCharge,
+  editCompletedBooking,
   updateBookingStatus,
   sendBookingOTP,
   verifyBookingOTP,

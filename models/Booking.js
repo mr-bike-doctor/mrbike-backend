@@ -377,6 +377,34 @@ const bookingSchema = new mongoose.Schema(
 
     additionalNotes: { type: [String], default: [] },
 
+    // Audit trail of edits the garage made between Complete Service and
+    // delivery (controller/booking.js#editCompletedBooking). Internal record
+    // for support/admin — not served to the customer. `default: undefined`
+    // keeps the path absent on bookings that were never edited.
+    postServiceEdits: {
+      type: [
+        {
+          _id: false,
+          editedAt: { type: Date, required: true },
+          editedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+          editedByRole: { type: String, enum: ["dealer", "admin"], required: true },
+          statusAtEdit: { type: String, default: null },
+          servicesAdded: [{ type: mongoose.Schema.Types.ObjectId, ref: "additionalServices" }],
+          servicesRemoved: [{ type: mongoose.Schema.Types.ObjectId, ref: "additionalServices" }],
+          previousAmountDue: { type: Number, default: null },
+          newAmountDue: { type: Number, default: null },
+          previousLastServiceKm: { type: Number, default: null },
+          newLastServiceKm: { type: Number, default: null },
+          notesChanged: { type: Boolean, default: false },
+          // True when a price change voided a payment method / QR the dealer
+          // had already chosen for the old amount.
+          paymentReset: { type: Boolean, default: false },
+        },
+      ],
+      default: undefined,
+      select: false,
+    },
+
     pickupDate: { type: Date, default: null },
 
     // Optional scheduling preferences
