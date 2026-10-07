@@ -3,6 +3,19 @@ const Ticket = require("../models/ticket_model")
 const Admin = require("../models/admin_model")
 const Customer = require("../models/customer_model")
 const Vendor = require("../models/dealerModel")
+const Booking = require("../models/Booking")
+
+const BOOKING_ISSUES = {
+  CANCEL_BOOKING: { label: "Cancel my booking", priority: "urgent" },
+  RESCHEDULE_PICKUP: { label: "Reschedule pickup", priority: "high" },
+  CHANGE_PICKUP_ADDRESS: { label: "Change pickup address", priority: "high" },
+  RIDER_DELAYED: { label: "Rider is late or did not arrive", priority: "urgent" },
+  GARAGE_NOT_RESPONDING: { label: "Garage is not responding", priority: "urgent" },
+  CHANGE_SERVICE: { label: "Change service or booking details", priority: "high" },
+  PAYMENT_REFUND: { label: "Payment or refund issue", priority: "high" },
+  STATUS_OR_OTP: { label: "Wrong status or OTP issue", priority: "high" },
+  OTHER_BOOKING_ISSUE: { label: "Other booking issue", priority: "normal" },
+}
 
 const parseTicketNo = (s) => {
   const str = String(s || "").trim()
@@ -90,7 +103,7 @@ const ROLE_TO_TICKET_TYPE = { customer: "user", dealer: "dealer" }
 const createTicket = async (req, res) => {
   try {
     const user_id = req.user_id
-    const { subject, message } = req.body
+    const { subject, message, bookingId, issueType } = req.body
     const user_type = ROLE_TO_TICKET_TYPE[req.auth?.role] || "user"
 
     if (!user_id) {
@@ -120,10 +133,41 @@ const createTicket = async (req, res) => {
     // sender_type falls back to user_type if not valid
     const msgSenderType = user_type
 
+    let bookingContext = null
+    let issue = null
+    if (bookingId || issueType) {
+      if (user_type !== "user") {
+        return res.status(400).json({ success: false, message: "Booking support is only available to customers" })
+      }
+      if (!mongoose.Types.ObjectId.isValid(bookingId)) {
+        return res.status(400).json({ success: false, message: "Invalid booking ID" })
+      }
+      issue = BOOKING_ISSUES[String(issueType || "").trim().toUpperCase()]
+      if (!issue) {
+        return res.status(400).json({ success: false, message: "Please select a valid booking issue" })
+      }
+      bookingContext = await Booking.findOne({ _id: bookingId, user_id })
+        .select("_id status dealerResponseStatus bookingId id")
+        .lean({ virtuals: true })
+      if (!bookingContext) {
+        return res.status(404).json({ success: false, message: "Booking not found" })
+      }
+    }
+
     const created = await Ticket.create({
       user_id,
       user_type,
       subject,
+      ...(bookingContext
+        ? {
+            booking_id: bookingContext._id,
+            source: "booking_support",
+            issue_type: String(issueType).trim().toUpperCase(),
+            issue_label: issue.label,
+            priority: issue.priority,
+            booking_status_at_creation: bookingContext.status || "",
+          }
+        : {}),
       messages: [
         {
           sender_id: msgSenderId,
@@ -142,9 +186,20 @@ const createTicket = async (req, res) => {
 
       const io = req.app.get("io")
       if (io) {
-        adminIds.forEach((id) =>
-          io.to(`admin:${id}`).emit("support:unread:changed", { ticketId: String(created._id) }),
-        )
+        adminIds.forEach((id) => {
+          const event = {
+            ticketId: String(created._id),
+            bookingId: created.booking_id ? String(created.booking_id) : null,
+            issueType: created.issue_type || null,
+            issueLabel: created.issue_label || null,
+            priority: created.priority,
+            subject: created.subject,
+          }
+          io.to(`admin:${id}`).emit("support:unread:changed", event)
+          if (created.source === "booking_support") {
+            io.to(`admin:${id}`).emit("support:booking:new", event)
+          }
+        })
       }
     }
 
@@ -323,6 +378,12 @@ const getAllUserAndDealerTickets = async (req, res) => {
         created_at: 1,
         ticketNo: 1,
         ticketId: 1, // virtual if enabled
+        booking_id: 1,
+        source: 1,
+        issue_type: 1,
+        issue_label: 1,
+        priority: 1,
+        booking_status_at_creation: 1,
         unreadFor: 1, // reduced to a per-viewer boolean below, never sent raw
       })
     }

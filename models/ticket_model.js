@@ -78,6 +78,30 @@ const TicketSchema = new mongoose.Schema(
 
     subject: { type: String, required: true, trim: true, maxlength: 255 },
 
+    // Booking support tickets stay attached to the exact order throughout the
+    // bot hand-off and the subsequent agent conversation.
+    booking_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Booking",
+      default: null,
+      index: true,
+    },
+    source: {
+      type: String,
+      enum: ["general", "booking_support"],
+      default: "general",
+      index: true,
+    },
+    issue_type: { type: String, default: "", trim: true, maxlength: 80, index: true },
+    issue_label: { type: String, default: "", trim: true, maxlength: 160 },
+    priority: {
+      type: String,
+      enum: ["normal", "high", "urgent"],
+      default: "normal",
+      index: true,
+    },
+    booking_status_at_creation: { type: String, default: "", trim: true, maxlength: 80 },
+
     status: {
       type: String,
       enum: Object.values(TICKET_STATUS),
