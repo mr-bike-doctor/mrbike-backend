@@ -15,6 +15,7 @@ const {
     getBookingDetails,
     updateBooking,
     updateTowingCharge,
+    updateBookingOperationalDetails,
     updateBookingStatus,
     verifyBookingOTP,
     sendBookingOTP,
@@ -99,6 +100,7 @@ router.post('/updateBooking', requireBookingParticipant(req => req.body.bookingI
 // Towing charge — dealer handling the booking or an admin, pre-payment only.
 // Recomputes the whole pricing breakdown server-side; see controller/booking.js.
 router.post('/:bookingId/towing-charge', requireBookingParticipant(req => req.params.bookingId), requireActorRoleAny("dealer", "admin"), updateTowingCharge)
+router.patch('/:bookingId/operational-details', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), updateBookingOperationalDetails)
 router.post('/updateBookingStatus/:bookingId/status', requireBookingParticipant(req => req.params.bookingId), updateBookingStatus)
 router.post('/sendBookingOTP', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), sendBookingOTP)
 router.post('/sendBookingMobile', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), sendOtpToMobile)

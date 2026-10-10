@@ -73,6 +73,10 @@ const {
   resolveCancellationReason,
   canCustomerCancel,
 } = require("../utils/bookingCancellation");
+const {
+  BookingOperationalUpdateError,
+  validateOperationalUpdate,
+} = require("../services/bookingOperationalUpdate");
 
 async function checkPermission(user_id, requiredPermission) {
   try {
@@ -3759,6 +3763,234 @@ async function updateTowingCharge(req, res) {
   }
 }
 
+// PATCH /bikedoctor/bookings/:bookingId/operational-details
+// Dealer-side correction of the condition observed at handover and/or the
+// remaining pickup/drop plan. Every monetary field is recomputed through the
+// pricing engine. Past pickup history, paid bills and delivered bookings are
+// never rewritten.
+async function updateBookingOperationalDetails(req, res) {
+  try {
+    const { bookingId } = req.params;
+    const { bikeCondition, transportOption, reason, dryRun = false } = req.body || {};
+    if (!mongoose.Types.ObjectId.isValid(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking id" });
+    }
+    if (bikeCondition === undefined && transportOption === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: "Send bikeCondition or transportOption to update.",
+        code: "NOTHING_TO_UPDATE",
+      });
+    }
+    if (reason !== undefined && (typeof reason !== "string" || reason.trim().length > 300)) {
+      return res.status(400).json({
+        success: false,
+        message: "Reason must be 300 characters or fewer.",
+        code: "INVALID_REASON",
+      });
+    }
+
+    const existingBooking = await booking
+      .findOne({ _id: bookingId, dealer_id: req.user_id })
+      .select("+bookingOperationalUpdates");
+    if (!existingBooking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    let nextCondition;
+    try {
+      nextCondition = bikeCondition === undefined
+        ? existingBooking.bikeCondition
+        : normalizeBikeCondition(bikeCondition);
+    } catch (error) {
+      if (error instanceof PricingError) {
+        return res.status(400).json({ success: false, message: error.message, code: error.code });
+      }
+      throw error;
+    }
+    const nextTransport = transportOption === undefined
+      ? existingBooking.transportOption
+      : String(transportOption).trim().toUpperCase();
+    const conditionChanged = nextCondition !== existingBooking.bikeCondition;
+    const transportChanged = nextTransport !== existingBooking.transportOption;
+
+    if (!conditionChanged && !transportChanged) {
+      return res.status(200).json({
+        success: true,
+        changed: false,
+        dryRun: Boolean(dryRun),
+        message: "No booking changes to save.",
+        data: {
+          bookingId: existingBooking._id,
+          bikeCondition: existingBooking.bikeCondition,
+          transportOption: existingBooking.transportOption,
+          amountDue: existingBooking.amountDue,
+        },
+      });
+    }
+
+    let legs;
+    try {
+      legs = validateOperationalUpdate({
+        booking: existingBooking,
+        nextTransportOption: nextTransport,
+        conditionChanged,
+      });
+    } catch (error) {
+      if (error instanceof BookingOperationalUpdateError) {
+        return res.status(error.statusCode).json({ success: false, message: error.message, code: error.code });
+      }
+      throw error;
+    }
+
+    const [dealer, bikeData, mainDocs, addlDocs] = await Promise.all([
+      Vendor.findById(existingBooking.dealer_id)
+        .select("tax commission pickupCharges dropCharges providesPickup providesDrop providesTowing towingCharges")
+        .lean(),
+      UserBike.findById(existingBooking.userBike_id)
+        .select("bike_cc variant_id")
+        .populate({ path: "variant_id", select: "model_id engine_cc" }),
+      AdminService.find({ _id: { $in: existingBooking.services } }).select("bikes"),
+      AdditionalService.find({ _id: { $in: existingBooking.additionalServices } }).select("bikes"),
+    ]);
+    if (!dealer) {
+      return res.status(404).json({ success: false, message: "Dealer not found for this booking" });
+    }
+
+    // Existing legs retain the rate agreed at booking time. A newly added leg
+    // uses the dealer's current configured rate and must currently be offered.
+    const pricingDealer = {
+      ...dealer,
+      pickupCharges: legs.previous.pickup && legs.next.pickup
+        ? existingBooking.pickupCharges
+        : dealer.pickupCharges,
+      dropCharges: legs.previous.drop && legs.next.drop
+        ? existingBooking.dropCharges
+        : dealer.dropCharges,
+      providesPickup: legs.previous.pickup && legs.next.pickup ? true : dealer.providesPickup,
+      providesDrop: legs.previous.drop && legs.next.drop ? true : dealer.providesDrop,
+    };
+
+    const bikeCC = resolveBikeCC(bikeData);
+    const pricingInput = {
+      services: mainDocs,
+      additionalServices: addlDocs,
+      bikeCC,
+      bikeContext: {
+        variantId: bikeData?.variant_id?._id || bikeData?.variant_id,
+        modelId: bikeData?.variant_id?.model_id,
+      },
+    };
+    const serviceLines = resolveServiceLines(pricingInput);
+    const serviceAmount = resolveServiceAmount(pricingInput);
+    const nextTowingRequired = isTowingRequired(nextCondition, nextTransport);
+    const towingChargeOverride = nextTowingRequired && existingBooking.towingRequired
+      ? existingBooking.towingCharge
+      : null;
+
+    let breakdown;
+    try {
+      breakdown = computePriceBreakdown({
+        serviceAmount,
+        transportOption: nextTransport,
+        dealer: pricingDealer,
+        discountAmount: existingBooking.discountAmount,
+        bikeCondition: nextCondition,
+        towingChargeOverride,
+        platformFeeOverride: existingBooking.platformFee,
+        platformFeeLabelOverride: existingBooking.platformFeeLabel,
+        commissionTaxRateOverride: existingBooking.commissionTaxRate,
+      });
+    } catch (error) {
+      if (error instanceof PricingError) {
+        return res.status(400).json({ success: false, message: error.message, code: error.code });
+      }
+      throw error;
+    }
+
+    const previousAmountDue = existingBooking.amountDue;
+    const previousCondition = existingBooking.bikeCondition;
+    const previousTransport = existingBooking.transportOption;
+    applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
+    existingBooking.bikeCondition = nextCondition;
+    existingBooking.towingRequired = nextTowingRequired;
+    existingBooking.towingNote = nextTowingRequired ? existingBooking.towingNote : null;
+
+    const responseData = {
+      bookingId: existingBooking._id,
+      bikeCondition: nextCondition,
+      towingRequired: nextTowingRequired,
+      towingCharge: breakdown.towingCharge,
+      transportOption: nextTransport,
+      pickupCharges: breakdown.pickupCharges,
+      dropCharges: breakdown.dropCharges,
+      subtotal: breakdown.subtotal,
+      taxAmount: breakdown.taxAmount,
+      customerTotal: breakdown.customerTotal,
+      discountAmount: breakdown.discountAmount,
+      amountDue: existingBooking.amountDue,
+      dealerEarnings: breakdown.dealerEarnings,
+    };
+
+    if (dryRun) {
+      return res.status(200).json({
+        success: true,
+        changed: true,
+        dryRun: true,
+        message: "Booking update preview ready.",
+        data: responseData,
+      });
+    }
+
+    if (conditionChanged) {
+      if (!existingBooking.customerDeclaredBikeCondition) {
+        existingBooking.customerDeclaredBikeCondition = previousCondition;
+      }
+      existingBooking.conditionVerifiedAt = new Date();
+      existingBooking.conditionVerifiedBy = req.user_id;
+    }
+    existingBooking.bookingOperationalUpdates = existingBooking.bookingOperationalUpdates || [];
+    existingBooking.bookingOperationalUpdates.push({
+      updatedAt: new Date(),
+      updatedBy: req.user_id,
+      reason: typeof reason === "string" && reason.trim() ? reason.trim() : null,
+      previousBikeCondition: previousCondition,
+      newBikeCondition: nextCondition,
+      previousTransportOption: previousTransport,
+      newTransportOption: nextTransport,
+      previousAmountDue,
+      newAmountDue: existingBooking.amountDue,
+    });
+    await existingBooking.save();
+
+    try {
+      const customer = await Customer.findById(existingBooking.user_id).select("device_token ftoken").lean();
+      await sendBookingNotification({
+        token: customer?.device_token || customer?.ftoken,
+        title: "Booking details updated",
+        body: `Garage updated bike condition or transport. New payable amount: ₹${existingBooking.amountDue}.`,
+        data: { type: "booking_operational_update", bookingId: String(existingBooking._id) },
+        receiverId: existingBooking.user_id,
+        receiverType: "user",
+        bookingId: existingBooking._id,
+      });
+    } catch (notificationError) {
+      console.error("[operational-update] customer notification failed:", notificationError.message);
+    }
+
+    return res.status(200).json({
+      success: true,
+      changed: true,
+      dryRun: false,
+      message: "Booking details updated successfully.",
+      data: responseData,
+    });
+  } catch (error) {
+    console.error("[updateBookingOperationalDetails] Error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+}
+
 /* ======================================================================
    EDIT A COMPLETED BOOKING  (Complete Service → delivery)
    ----------------------------------------------------------------------
@@ -4366,6 +4598,7 @@ module.exports = {
   getBookingDetails,
   updateBooking,
   updateTowingCharge,
+  updateBookingOperationalDetails,
   editCompletedBooking,
   getBookingAdditionalServiceOptions,
   updateBookingStatus,

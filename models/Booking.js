@@ -278,6 +278,15 @@ const bookingSchema = new mongoose.Schema(
       enum: Object.values(BIKE_CONDITIONS),
       default: BIKE_CONDITIONS.RIDEABLE,
     },
+    // When the garage records the condition it actually observes at handover,
+    // preserve what the customer originally declared for dispute/support use.
+    customerDeclaredBikeCondition: {
+      type: String,
+      enum: [...Object.values(BIKE_CONDITIONS), null],
+      default: null,
+    },
+    conditionVerifiedAt: { type: Date, default: null },
+    conditionVerifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Vendor", default: null },
     towingRequired: { type: Boolean, default: false },
     // Optional short note from the customer describing the problem, only
     // captured when towing is required.
@@ -292,6 +301,26 @@ const bookingSchema = new mongoose.Schema(
       type: String,
       enum: ["SELF_VISIT", "PICKUP_ONLY", "DROP_ONLY", "PICKUP_AND_DROP"],
       default: "SELF_VISIT",
+    },
+    // Provider-side condition/transport changes before final delivery. Kept
+    // internal, but gives support a complete before/after and price audit.
+    bookingOperationalUpdates: {
+      type: [
+        {
+          _id: false,
+          updatedAt: { type: Date, required: true },
+          updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Vendor", default: null },
+          reason: { type: String, default: null, maxlength: 300 },
+          previousBikeCondition: { type: String, default: null },
+          newBikeCondition: { type: String, default: null },
+          previousTransportOption: { type: String, default: null },
+          newTransportOption: { type: String, default: null },
+          previousAmountDue: { type: Number, default: null },
+          newAmountDue: { type: Number, default: null },
+        },
+      ],
+      default: undefined,
+      select: false,
     },
     serviceAmount: { type: Number, default: 0 },
     // Part of the pricing snapshot (and therefore of the subtotal, tax and

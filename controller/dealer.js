@@ -5,6 +5,8 @@ const Vendor = require("../models/dealerModel");
 const jwt = require("jsonwebtoken");
 var validation = require("../helper/validation");
 const { getDealerStatus, isDealerBookable } = require("../helper/dealerStatus");
+const { DEALER_LIST_TABS, STAGE_LABELS, getDealerStage, stageFilter } = require("../helper/dealerStage");
+const Booking = require("../models/Booking");
 const {
   getDealerServiceRadiusKm,
   isWithinServiceRadius,
@@ -1245,6 +1247,129 @@ async function dealerList(req, res) {
   }
 }
 
+// Fields the admin dealer list renders. Excludes OTP, session and document
+// payloads so a list page never ships credentials or KYC images.
+const ADMIN_DEALER_LIST_FIELDS = [
+  "id", "shopName", "ownerName", "phone", "email", "shopEmail", "personalEmail",
+  "shopContact", "city", "state", "permanentAddress.city", "permanentAddress.state",
+  "providesPickup", "providesDrop", "registrationStatus", "dealerStatus",
+  "isActive", "isBlocked", "status", "submittedAt", "approvedAt",
+  "reVerification", "formProgress", "createdAt", "updatedAt", "online",
+].join(" ");
+
+const ADMIN_DEALER_SORT_FIELDS = ["createdAt", "updatedAt", "submittedAt", "approvedAt", "shopName", "ownerName", "city"];
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * GET /bikedoctor/dealer/admin/dealers
+ * Admin dealer list — all filtering, search, sorting, pagination and tab
+ * counts happen here so the panel only renders what it gets back.
+ *
+ * Query: stage (all|new|waiting_review|reverification|approved|active|
+ *        inactive|rejected|blocked), search, page (1-based), limit (≤100),
+ *        sortBy, order (asc|desc).
+ */
+async function adminDealerList(req, res) {
+  try {
+    const stage = String(req.query.stage || "all");
+    const baseFilter = stageFilter(stage);
+    if (!baseFilter) {
+      return res.status(400).json({
+        status: false,
+        message: `Invalid stage. Allowed: ${DEALER_LIST_TABS.join(", ")}`,
+      });
+    }
+
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const sortBy = ADMIN_DEALER_SORT_FIELDS.includes(req.query.sortBy) ? req.query.sortBy : "createdAt";
+    const order = req.query.order === "asc" ? 1 : -1;
+
+    // Search narrows every tab (and its count) the same way.
+    const search = String(req.query.search || "").trim().slice(0, 100);
+    let searchFilter = {};
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), "i");
+      const or = [
+        { shopName: rx }, { ownerName: rx }, { phone: rx }, { shopContact: rx },
+        { email: rx }, { shopEmail: rx }, { personalEmail: rx },
+        { city: rx }, { "permanentAddress.city": rx },
+      ];
+      // "MRBD0012" / "12" → the auto-increment dealer id.
+      const idMatch = search.match(/^(?:mrbd)?0*(\d+)$/i);
+      if (idMatch) or.push({ id: Number(idMatch[1]) });
+      searchFilter = { $or: or };
+    }
+
+    const listFilter = search ? { $and: [baseFilter, searchFilter] } : baseFilter;
+    const countFor = (tab) => {
+      const f = stageFilter(tab);
+      return Vendor.countDocuments(search ? { $and: [f, searchFilter] } : f);
+    };
+
+    const [dealers, total, countValues] = await Promise.all([
+      Vendor.find(listFilter)
+        .select(ADMIN_DEALER_LIST_FIELDS)
+        .sort({ [sortBy]: order, _id: order })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Vendor.countDocuments(listFilter),
+      Promise.all(DEALER_LIST_TABS.map(countFor)),
+    ]);
+
+    const counts = Object.fromEntries(DEALER_LIST_TABS.map((tab, i) => [tab, countValues[i]]));
+
+    // Cancellation rate for just this page's dealers.
+    const pageIds = dealers.map((d) => d._id);
+    const bookingStats = pageIds.length
+      ? await Booking.aggregate([
+          { $match: { dealer_id: { $in: pageIds } } },
+          {
+            $group: {
+              _id: "$dealer_id",
+              total: { $sum: 1 },
+              cancelled: {
+                $sum: { $cond: [{ $regexMatch: { input: { $ifNull: ["$status", ""] }, regex: /cancel/i } }, 1, 0] },
+              },
+            },
+          },
+        ])
+      : [];
+    const statsById = new Map(bookingStats.map((s) => [String(s._id), s]));
+
+    const data = dealers.map((dealer) => {
+      const stats = statsById.get(String(dealer._id));
+      const stageId = getDealerStage(dealer);
+      const { formProgress, ...rest } = dealer;
+      return {
+        ...rest,
+        dealerId: dealer.id ? `MRBD${String(dealer.id).padStart(4, "0")}` : null,
+        stage: stageId,
+        stageLabel: STAGE_LABELS[stageId],
+        bookingStats: {
+          total: stats?.total || 0,
+          cancelled: stats?.cancelled || 0,
+          cancelRate: stats?.total ? Number(((stats.cancelled / stats.total) * 100).toFixed(1)) : 0,
+        },
+      };
+    });
+
+    return res.status(200).json({
+      status: true,
+      message: "Success",
+      data,
+      counts,
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      filters: { stage, search, sortBy, order: order === 1 ? "asc" : "desc" },
+    });
+  } catch (error) {
+    console.error("Admin dealer list error:", error);
+    return res.status(500).json({ status: false, message: "Failed to fetch dealers" });
+  }
+}
+
 async function deleteDealer(req, res) {
   try {
     const { dealer_id } = req.body;
@@ -1574,6 +1699,7 @@ module.exports = {
   getActiveDealers,
   getDealerActivityHistory,
   dealerList,
+  adminDealerList,
   deleteDealer,
   singledealer,
   dealerWithInRange,

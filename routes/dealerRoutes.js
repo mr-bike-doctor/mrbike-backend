@@ -19,6 +19,7 @@ const {
 } = require("../helper/dealerServiceRadius")
 var {
   dealerList,
+  adminDealerList,
   deleteDealer,
   singledealer,
   dealerWithInRange,
@@ -541,6 +542,9 @@ router.put(
 )
 
 router.get("/dealerList", requireAdmin, dealerList)
+// Admin dealer list with server-side stage tabs, search, sort, pagination
+// and per-tab counts (helper/dealerStage.js).
+router.get("/admin/dealers", requireAdmin, adminDealerList)
 router.get("/dealerWithInRange", attachCustomerIfPresent, dealerWithInRange)
 router.get("/dealerWithInRange2", dealerWithInRange2)
 router.get("/dealer/:id", verifyDealerToken, requireOwnDealer("id"), singledealer)
