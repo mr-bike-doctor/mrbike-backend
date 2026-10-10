@@ -66,9 +66,13 @@ const { isDealerBookable } = require("../helper/dealerStatus");
 const {
   isPickupBooking,
   canMarkCustomerArrived,
+  canTransitionDuringGarageTransport,
   PICKUP_STATUSES,
 } = require("../services/pickupLifecycle");
 const { verifyPickupOtp } = require("./pickupLifecycleController");
+const { canTransitionBookingStatus } = require("../services/bookingStatusPolicy");
+const { createAdminBookingAuditEvent, saveBookingWithAdminAudit, correlationId, snapshotFields } = require("../services/bookingAudit");
+const { removeAdminBookingOtpFields } = require("../services/bookingResponsePrivacy");
 const {
   resolveCancellationReason,
   canCustomerCancel,
@@ -122,24 +126,24 @@ async function addbooking(req, res) {
 
 async function getbooking(req, res) {
   try {
-    const data = jwt_decode(req.headers.token);
-    const user_id = data.user_id;
-    const user_type = data.user_type;
-    const type = data.type;
-    if (user_id == null || user_type != 1 && user_type != 2 && user_type != 4) {
-      var response = {
-        status: 401,
-        message: "admin is un-authorised !",
-      };
-      return res.status(401).send(response);
-    }
-
-    let bookingresponce = await booking.findOne({ _id: req.params.id })
+    if (!req.auth) return res.status(401).json({ success: false, message: "Authentication required" });
+    const ownerFilter = req.auth.role === "admin"
+      ? { _id: req.params.id }
+      : req.auth.role === "dealer"
+        ? { _id: req.params.id, dealer_id: req.auth.id }
+        : { _id: req.params.id, user_id: req.auth.id };
+    let bookingQuery = booking.findOne(ownerFilter);
+    if (req.auth?.role === "admin") bookingQuery = bookingQuery.select("-pickupOtp -pickupOtpExpiresAt -deliveryOtp");
+    let bookingresponce = await bookingQuery
       .populate({ path: "service_id", select: ['name', 'image', 'description'] })
       .populate({ path: "created_by", select: ['first_name', 'email', 'last_name', 'phone', 'image', 'address', 'city'] })
     // .populate({path:"service_provider_id",select: ['name', 'email', 'phone']})
 
     if (bookingresponce) {
+      if (req.auth?.role === "admin") {
+        const safeData = removeAdminBookingOtpFields(bookingresponce.toObject());
+        bookingresponce = safeData;
+      }
       var response = {
         status: 200,
         message: "successfull",
@@ -281,7 +285,8 @@ const getuserbookings = async (req, res) => {
 
       // Add pricing information to each booking
       // Priority: Bill data > Booking totalBill > 0
-      const enrichedBookings = userBookings.map(b => {
+      const enrichedBookings = userBookings.map(rawBooking => {
+        const b = req.auth?.role === "admin" ? removeAdminBookingOtpFields(rawBooking) : rawBooking;
         const bill = billMap[b._id.toString()];
         
         // Use bill data if available, otherwise use booking's totalBill
@@ -323,14 +328,17 @@ const getuserbookings = async (req, res) => {
       console.log("Error fetching bills, using booking totalBill instead:", billError.message);
       
       // Fallback: Use booking's totalBill if bill fetch fails
-      const enrichedBookings = userBookings.map(b => ({
-        ...b,
-        subtotal: b.totalBill || 0,
-        tax_amount: 0,
-        grandTotal: b.totalBill || 0,
-        pickupCharges: b.pickupCharges || 0,
-        dropCharges: b.dropCharges || 0,
-      }));
+      const enrichedBookings = userBookings.map(rawBooking => {
+        const b = req.auth?.role === "admin" ? removeAdminBookingOtpFields(rawBooking) : rawBooking;
+        return {
+          ...b,
+          subtotal: b.totalBill || 0,
+          tax_amount: 0,
+          grandTotal: b.totalBill || 0,
+          pickupCharges: b.pickupCharges || 0,
+          dropCharges: b.dropCharges || 0,
+        };
+      });
 
       return res.status(200).json({
         status: 200,
@@ -413,204 +421,23 @@ const getuserbookings = async (req, res) => {
 // };
 
 async function deletebooking(req, res) {
-  try {
-
-    const data = jwt_decode(req.headers.token);
-    const user_id = data.user_id;
-    const user_type = data.user_type;
-    const type = data.type;
-
-    if (user_id == null || user_type != 1) {
-
-
-      if (user_type === 3) {
-        const subAdmin = await Admin.findById(user_id)
-
-        if (!subAdmin) {
-          var response = {
-            status: 401,
-            message: "Subadmin not found!",
-          };
-          return res.status(401).send(response);
-        }
-
-        if (user_type === 3) {
-          const subAdmin = await Admin.findById(user_id)
-
-          if (!subAdmin) {
-            var response = {
-              status: 401,
-              message: "Subadmin not found!",
-            };
-            return res.status(401).send(response);
-          }
-        }
-
-        const isAllowed = await checkPermission(user_id, "Booking.delete");
-
-        if (!isAllowed) {
-          var response = {
-            status: 401,
-            message: "Subadmin does not have permission to add Booking!",
-          };
-          return res.status(401).send(response);
-        }
-
-      }
-
-    }
-
-
-
-    const { booking_id } = req.body;
-    const bookingRes = await booking.findOne({ _id: booking_id });
-    if (bookingRes) {
-      booking.findByIdAndDelete({ _id: booking_id }, async function (err, docs) {
-        if (err) {
-          var response = {
-            status: 201,
-            message: "Booking delete failed",
-          };
-          return res.status(201).send(response);
-        } else {
-          var response = {
-            status: 200,
-            message: "Booking deleted successfully",
-          };
-          return res.status(200).send(response);
-        }
-      });
-    } else {
-      var response = {
-        status: 201,
-        message: "Booking not Found",
-      };
-
-      return res.status(201).send(response);
-    }
-  } catch (error) {
-    console.log("error", error);
-    response = {
-      status: 201,
-      message: "Operation was not successful",
-    };
-    return res.status(201).send(response);
-  }
+  // Booking records are operational and financial evidence. Hard deletion is
+  // retired; use a guarded cancellation workflow that preserves history.
+  return res.status(410).json({
+    success: false,
+    code: "BOOKING_HARD_DELETE_RETIRED",
+    message: "Bookings cannot be deleted. Use the supported cancellation workflow.",
+  });
 }
 
 async function updateBookings(req, res) {
-  try {
-    const data = jwt_decode(req.headers.token);
-    const user_id = data.user_id;
-    const user_type = data.user_type;
-    const type = data.type;
-    if (user_id == null || user_type != 1 && user_type != 2 && user_type != 4) {
-      var response = {
-        status: 401,
-        message: "Admin is un-authorised !",
-      };
-      return res.status(401).send(response);
-    }
-
-    const { status, dealer_id, additonal_options, estimated_cost, final_cost, additonal_data_moveable } = req.body;
-
-    let bookings = await booking.findById(req.params.id);
-
-    if (!bookings) {
-      res.status(201).json({ status: 201, error: "No Booking Found" });
-      return;
-    }
-
-    const user = await customers.findById(bookings.created_by).exec();
-
-    if (bookings.status === status) {
-      res.status(201).json({ status: 201, message: `Booking is Already ${status}` });
-      return;
-    }
-
-    if (status === "completed") {
-      await handleBookingCompletion(bookings);
-    }
-
-    let dealers = await Vendor.findOne({ _id: dealer_id }); // changes
-
-    if (!dealers) {
-      res.status(201).json({ status: 201, error: "No Dealer Found" });
-      return;
-    }
-
-    // Block booking acceptance if dealer has exceeded credit limit
-    if (status === "confirmed") {
-      const BOOKING_CREDIT_LIMIT = -500;
-      if (parseFloat(dealers.wallet) < BOOKING_CREDIT_LIMIT) {
-        return res.status(200).json({
-          status: 200,
-          message: "Booking cannot be accepted. Please clear your outstanding dues to continue accepting bookings."
-        });
-      }
-    }
-
-    const datas =
-    {
-      status: status,
-      dealer_name: dealers.shopName,
-      dealr_id: dealers.id,
-      dealer_id: dealer_id,
-      dealer_address: dealers.fullAddress,
-      dealer_phone: dealers.phone,
-      additonal_options: additonal_options,
-      estimated_cost: estimated_cost,
-      final_cost: final_cost,
-      additonal_data_moveable,
-    };
-
-    booking.findByIdAndUpdate(
-      { _id: req.params.id },
-      { $set: datas },
-      { new: true },
-      async function (err, docs) {
-        if (err) {
-          var response = {
-            status: 201,
-            message: err,
-          };
-          return res.status(201).send(response);
-        }
-        else {
-          // const sphone = vendors.phone
-          // const uphone = user.phone
-          // const service_provider_address = docs.service_provider_address
-          // const user_address = user.address
-
-          // const data = await otpAuth.pickndropotp(sphone,uphone,service_provider_address,user_address)
-          // docs.otp = data.otp
-
-          // push notification on booking update
-          if (status == "rejected") {
-            Notification(user?.device_token || user?.ftoken, `Sorry ${user?.first_name} , Your Booking of ${bookings?.brand} ${bookings?.model} has been Rejected`, user?.id);
-          } else {
-            Notification(user?.device_token || user?.ftoken, `Hi ${user?.first_name} , Your Booking of ${bookings?.brand} ${bookings?.model} ${status} successfully`, user?.id);
-          }
-
-          var response = {
-            status: 200,
-            message: "Booking updated successfully",
-            // data: docs,
-            // image_base_url: process.env.BASE_URL,
-          };
-          return res.status(200).send(response);
-        }
-      }
-    );
-
-  } catch (error) {
-    console.log("error", error);
-    response = {
-      status: 201,
-      message: "Operation was not successful",
-    };
-    return res.status(201).send(response);
-  }
+  // Retired legacy endpoint: it wrote status, provider assignment, and prices
+  // directly without lifecycle validation or pricing-engine recalculation.
+  return res.status(410).json({
+    success: false,
+    code: "LEGACY_BOOKING_UPDATE_RETIRED",
+    message: "This booking update endpoint is retired. Use the guarded booking operations.",
+  });
 }
 
 // Create Booking
@@ -1275,7 +1102,7 @@ async function getBookingDetails(req, res) {
 
     const bookingData = await bookingQuery
       .populate("user_id", "first_name last_name phone email image address city")
-      .populate("dealer_id", "shopName fullAddress address city locality shopImages phone averageRating ratingCount status dealerStatus")
+      .populate("dealer_id", "shopName fullAddress address city locality shopImages phone averageRating ratingCount status dealerStatus latitude longitude")
       .populate("reviewId", "rating createdAt")
       .populate({
         path: "services",
@@ -1334,9 +1161,10 @@ async function getBookingDetails(req, res) {
       delete result.pickupOtp;
       delete result.pickupOtpExpiresAt;
     }
+    const responseResult = req.auth?.role === "admin" ? removeAdminBookingOtpFields(result) : result;
 
     console.log("Returning booking details with grandTotal:", grandTotal);
-    res.status(200).json({ success: true, data: result });
+    res.status(200).json({ success: true, data: responseResult });
   } catch (error) {
     console.error("Error in getBookingDetails:", error);
     res.status(500).json({ 
@@ -1357,7 +1185,6 @@ async function getBookingDetails(req, res) {
 // the schema-level guard in models/Booking.js rejects any attempt to slip a
 // locked field through regardless, but we never even try here.
 const UPDATE_BOOKING_ALLOWED_FIELDS = [
-  "billGenerated",
   "lastServiceKm",
   "pickupDate",
   "scheduleDate",
@@ -1365,7 +1192,6 @@ const UPDATE_BOOKING_ALLOWED_FIELDS = [
   "pickupAddress",
   "additionalNotes",
   "serviceDate",
-  "pickupStatus",
 ];
 
 class RepriceError extends Error {
@@ -1473,10 +1299,13 @@ async function repriceAdditionalServices(existingBooking, addedAdditionalIds = [
 
 async function updateBooking(req, res) {
   try {
-    const { bookingId, ...updateFields } = req.body;
+    const { bookingId, reason, approvalReference, consentReference, ...updateFields } = req.body;
 
     if (!bookingId) {
       return res.status(400).json({ success: false, message: "Booking ID is required" });
+    }
+    if (req.auth?.role === "admin" && (typeof reason !== "string" || !reason.trim())) {
+      return res.status(400).json({ success: false, code: "ADMIN_REASON_REQUIRED", message: "A reason is required for admin booking changes" });
     }
 
     // Scoped to whichever participant is authenticated (requireBookingParticipant
@@ -1489,6 +1318,17 @@ async function updateBooking(req, res) {
     if (!existingBooking) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
+    const requestedAuditFields = Object.keys(updateFields).filter((field) =>
+      field === "services" || UPDATE_BOOKING_ALLOWED_FIELDS.includes(field)
+    );
+    const auditFields = [...requestedAuditFields];
+    if (requestedAuditFields.includes("services")) {
+      auditFields.push(
+        "additionalServices", "serviceAmount", "towingCharge", "pickupCharges",
+        "dropCharges", "subtotal", "taxAmount", "customerTotal", "discountAmount", "dealerEarnings",
+      );
+    }
+    const auditBefore = req.auth?.role === "admin" ? snapshotFields(existingBooking, auditFields) : null;
 
     const rejectedFields = Object.keys(updateFields).filter(
       (key) => key !== "services" && !UPDATE_BOOKING_ALLOWED_FIELDS.includes(key)
@@ -1609,7 +1449,23 @@ async function updateBooking(req, res) {
       }
     }
 
-    await existingBooking.save();
+    if (req.auth?.role === "admin") {
+      const auditEvent = createAdminBookingAuditEvent({
+          bookingId: existingBooking._id,
+          adminId: req.auth.id,
+          adminRole: req.auth.adminRole,
+          action: "booking.update",
+          reason,
+          before: auditBefore,
+          after: snapshotFields(existingBooking, auditFields),
+          approvalReference,
+          consentReference,
+          requestId: correlationId(req),
+      });
+      await saveBookingWithAdminAudit(existingBooking, auditEvent);
+    } else {
+      await existingBooking.save();
+    }
 
     // ✅ Populate the correct path for an ObjectId[] ref
     await existingBooking.populate({
@@ -1745,6 +1601,13 @@ async function updateBookingStatus(req, res) {
       });
     }
 
+    if (req.auth?.role !== "dealer" || !["confirmed", "rejected"].includes(status)) {
+      return res.status(403).json({ success: false, message: "Only the assigned provider may accept or reject a pending booking" });
+    }
+    if (!canTransitionBookingStatus(req.auth.role, existingBooking.status, status)) {
+      return res.status(409).json({ success: false, message: "This booking status transition is not allowed" });
+    }
+
     // Verify the requesting user has rights to update this booking
     if (existingBooking.user_id.toString() !== user_id &&
       existingBooking.dealer_id.toString() !== user_id) {
@@ -1756,6 +1619,13 @@ async function updateBookingStatus(req, res) {
 
     if (req.auth?.role === "customer" && !["cancelled", "user_cancelled"].includes(status)) {
       return res.status(403).json({ success: false, message: "Customers may only cancel their own booking" });
+    }
+
+    if (isPickupBooking(existingBooking) && !canTransitionDuringGarageTransport(existingBooking, status)) {
+      return res.status(409).json({
+        success: false,
+        message: "Confirm arrival at the assigned garage before advancing this booking",
+      });
     }
 
     // ── Expiry window guard (confirmed / rejected only) ──────────────────────
@@ -1797,6 +1667,7 @@ async function updateBookingStatus(req, res) {
       const atomicResult = await booking.findOneAndUpdate(
         {
           _id: existingBooking._id,
+          dealer_id: req.auth.id,
           status: "pending",
           dealerResponseStatus: "awaiting",
           timerExpiresAt: { $gt: new Date() },
@@ -1958,11 +1829,22 @@ async function updateBookingStatus(req, res) {
 
       existingBooking.status = status;
 
+      if (["cancelled", "user_cancelled", "rejected", "expired"].includes(status) && existingBooking.deliveryTransportStatus === "OUT_FOR_DELIVERY") {
+        existingBooking.deliveryTransportStatus = "NOT_STARTED";
+        existingBooking.deliveryTransportCancelledAt = new Date();
+      }
+
       if (status === "cash received") {
         existingBooking.billStatus = "paid";
       }
 
       await existingBooking.save();
+
+      if (["cancelled", "user_cancelled", "rejected", "expired"].includes(status)) {
+        req.app.get("io")?.to(`booking:${existingBooking._id}`).emit("delivery:stopped", {
+          bookingId: String(existingBooking._id), status, deliveryTransportStatus: existingBooking.deliveryTransportStatus || "NOT_STARTED", trackingActive: false,
+        });
+      }
 
       if (["cancelled", "user_cancelled", "rejected", "expired"].includes(status)) {
         try {
@@ -2727,7 +2609,8 @@ async function getallbookings(req, res) {
 
     if (bookingresponce.length > 0) {
       const data = bookingresponce.map((doc) => {
-        const item = doc.toObject({ virtuals: true });
+        // OTP values are never part of the broad booking-list response.
+        const item = removeAdminBookingOtpFields(doc.toObject({ virtuals: true }));
         const userBike = item.userBike_id;
         const variant = userBike?.variant_id;
         const model = variant?.model_id;
@@ -2996,6 +2879,13 @@ const serviceComplete = async (req, res) => {
       return res.status(409).json({
         success: false,
         message: "Bike pickup must be completed before the service can be marked complete",
+      });
+    }
+
+    if (isPickupBooking(bookingDoc) && bookingDoc.garageTransportStatus === "TO_GARAGE") {
+      return res.status(409).json({
+        success: false,
+        message: "Confirm arrival at the assigned garage before marking service complete",
       });
     }
 
@@ -3386,6 +3276,10 @@ const verifyDeliveryOtp = async (req, res) => {
       });
     }
 
+    if (bookingDoc.deliveryTransportStatus === "OUT_FOR_DELIVERY") {
+      return res.status(409).json({ success: false, message: "Provider must confirm customer arrival before delivery OTP verification" });
+    }
+
     // Lockout guard — checked before touching DB again
     if (bookingDoc.otp_failed_attempts >= 5) {
       return res.status(423).json({
@@ -3422,6 +3316,8 @@ const verifyDeliveryOtp = async (req, res) => {
     bookingDoc.otp_verified         = true;
     bookingDoc.delivered_at         = new Date();
     bookingDoc.status               = "delivered";
+    bookingDoc.deliveryTransportStatus = "DELIVERED";
+    bookingDoc.deliveryTransportCompletedAt = new Date();
     // Delivery is the final lifecycle gate. Payment and invoice guards above
     // have already succeeded before a delivery OTP can be issued/verified.
     bookingDoc.reviewStatus         = "pending";
@@ -3474,6 +3370,9 @@ const verifyDeliveryOtp = async (req, res) => {
         bookingId,
         status: "delivered",
         delivered_at: bookingDoc.delivered_at,
+      });
+      io.to(`booking:${bookingDoc._id}`).emit("delivery:completed", {
+        bookingId: String(bookingDoc._id), status: "delivered", deliveryTransportStatus: "DELIVERED", trackingActive: false,
       });
     }
 
@@ -3614,6 +3513,10 @@ async function updateTowingCharge(req, res) {
     const { bookingId } = req.params;
     const { towingCharge } = req.body;
 
+    if (req.auth?.role === "admin" && (typeof req.body?.reason !== "string" || !req.body.reason.trim())) {
+      return res.status(400).json({ success: false, code: "ADMIN_REASON_REQUIRED", message: "A reason is required for admin charge changes" });
+    }
+
     if (towingCharge === undefined || towingCharge === null || towingCharge === "") {
       return res.status(400).json({ success: false, message: "towingCharge is required" });
     }
@@ -3635,6 +3538,13 @@ async function updateTowingCharge(req, res) {
     if (!existingBooking) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
+
+    const auditFields = [
+      "towingCharge", "serviceAmount", "pickupCharges", "dropCharges", "subtotal",
+      "taxRate", "taxAmount", "platformFee", "customerTotal", "discountAmount",
+      "commissionAmount", "commissionTaxAmount", "dealerEarnings",
+    ];
+    const auditBefore = req.auth?.role === "admin" ? snapshotFields(existingBooking, auditFields) : null;
 
     if (!existingBooking.towingRequired) {
       return res.status(400).json({
@@ -3723,7 +3633,23 @@ async function updateTowingCharge(req, res) {
     applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
     existingBooking.towingChargeUpdatedAt = new Date();
     existingBooking.towingChargeUpdatedByRole = req.auth?.role === "admin" ? "admin" : "dealer";
-    await existingBooking.save();
+    if (req.auth?.role === "admin") {
+      const auditEvent = createAdminBookingAuditEvent({
+          bookingId: existingBooking._id,
+          adminId: req.auth.id,
+          adminRole: req.auth.adminRole,
+          action: "booking.towing_charge.update",
+          reason: req.body?.reason,
+          before: auditBefore,
+          after: snapshotFields(existingBooking, auditFields),
+          approvalReference: req.body?.approvalReference,
+          consentReference: req.body?.consentReference,
+          requestId: correlationId(req),
+      });
+      await saveBookingWithAdminAudit(existingBooking, auditEvent);
+    } else {
+      await existingBooking.save();
+    }
 
     console.log(
       `[TOWING-CHARGE] booking ${existingBooking.bookingId || existingBooking._id} set to ₹${breakdown.towingCharge} by ${existingBooking.towingChargeUpdatedByRole}`
@@ -3769,9 +3695,10 @@ async function updateTowingCharge(req, res) {
 // pricing engine. Past pickup history, paid bills and delivered bookings are
 // never rewritten.
 async function updateBookingOperationalDetails(req, res) {
+  let lockToken = null;
   try {
     const { bookingId } = req.params;
-    const { bikeCondition, transportOption, reason, dryRun = false } = req.body || {};
+    const { bikeCondition, transportOption, reason, dryRun = false, customerApproved = false } = req.body || {};
     if (!mongoose.Types.ObjectId.isValid(bookingId)) {
       return res.status(400).json({ success: false, message: "Invalid booking id" });
     }
@@ -3911,6 +3838,32 @@ async function updateBookingOperationalDetails(req, res) {
     const previousAmountDue = existingBooking.amountDue;
     const previousCondition = existingBooking.bikeCondition;
     const previousTransport = existingBooking.transportOption;
+    const originalState = {
+      status: existingBooking.status,
+      payment_status: existingBooking.payment_status,
+      billStatus: existingBooking.billStatus,
+      payment_method: existingBooking.payment_method,
+    };
+    const nextAmountDue = round2(breakdown.customerTotal - breakdown.discountAmount);
+    const amountChanged = Math.abs(nextAmountDue - previousAmountDue) >= 0.01;
+    if (amountChanged && !dryRun && customerApproved !== true) {
+      return res.status(409).json({
+        success: false,
+        message: "Customer approval is required before changing the booking amount.",
+        code: "CUSTOMER_APPROVAL_REQUIRED",
+        amountDue: nextAmountDue,
+      });
+    }
+
+    // If a method/QR was prepared for the old amount, hold the payment lock,
+    // void its pending session, and send the customer back to payment choice.
+    const paymentReset = originalState.status === "payment_selected" && amountChanged;
+    if (!dryRun && paymentReset) {
+      lockToken = await acquirePaymentOrderLock(bookingId);
+      await cancelPendingPaymentSessions(bookingId, "booking_transport_or_condition_changed");
+      existingBooking.status = "awaiting_payment";
+      existingBooking.payment_method = null;
+    }
     applyBreakdownToBooking(existingBooking, breakdown, { serviceLines });
     existingBooking.bikeCondition = nextCondition;
     existingBooking.towingRequired = nextTowingRequired;
@@ -3930,6 +3883,9 @@ async function updateBookingOperationalDetails(req, res) {
       discountAmount: breakdown.discountAmount,
       amountDue: existingBooking.amountDue,
       dealerEarnings: breakdown.dealerEarnings,
+      previousAmountDue,
+      amountChanged,
+      paymentReset,
     };
 
     if (dryRun) {
@@ -3960,22 +3916,52 @@ async function updateBookingOperationalDetails(req, res) {
       newTransportOption: nextTransport,
       previousAmountDue,
       newAmountDue: existingBooking.amountDue,
+      customerApprovedCharges: amountChanged && customerApproved === true,
     });
-    await existingBooking.save();
+    await existingBooking.validate();
+    const changes = existingBooking.getChanges();
+    const updateResult = await booking.updateOne(
+      {
+        _id: existingBooking._id,
+        dealer_id: existingBooking.dealer_id,
+        status: originalState.status,
+        payment_status: originalState.payment_status,
+        billStatus: originalState.billStatus,
+      },
+      changes,
+      { [PRICING_WRITE_BYPASS_FLAG]: true }
+    );
+    if (!updateResult.matchedCount) {
+      return res.status(409).json({
+        success: false,
+        message: "Booking or payment changed while you were updating it. Reopen the booking and try again.",
+        code: "BOOKING_CHANGED",
+      });
+    }
 
-    try {
+    if (amountChanged) try {
       const customer = await Customer.findById(existingBooking.user_id).select("device_token ftoken").lean();
       await sendBookingNotification({
         token: customer?.device_token || customer?.ftoken,
-        title: "Booking details updated",
-        body: `Garage updated bike condition or transport. New payable amount: ₹${existingBooking.amountDue}.`,
-        data: { type: "booking_operational_update", bookingId: String(existingBooking._id) },
+        title: "Your booking total changed",
+        body: `The garage updated bike condition or pickup/drop. New amount: ₹${existingBooking.amountDue}. Please review it before payment.`,
+        data: { type: "bill_updated", bookingId: String(existingBooking._id) },
         receiverId: existingBooking.user_id,
         receiverType: "user",
         bookingId: existingBooking._id,
       });
     } catch (notificationError) {
       console.error("[operational-update] customer notification failed:", notificationError.message);
+    }
+
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`user:${existingBooking.user_id}`).emit("booking:updated", {
+        bookingId: String(existingBooking._id),
+        transportOption: nextTransport,
+        bikeCondition: nextCondition,
+        amountDue: existingBooking.amountDue,
+      });
     }
 
     return res.status(200).json({
@@ -3988,6 +3974,8 @@ async function updateBookingOperationalDetails(req, res) {
   } catch (error) {
     console.error("[updateBookingOperationalDetails] Error:", error);
     return res.status(500).json({ success: false, message: "Internal Server Error" });
+  } finally {
+    if (lockToken) await releasePaymentOrderLock(req.params.bookingId, lockToken);
   }
 }
 

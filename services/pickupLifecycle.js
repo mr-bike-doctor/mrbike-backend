@@ -11,6 +11,8 @@ const PICKUP_STATUSES = Object.freeze({
 
 const PICKUP_TRANSPORT_OPTIONS = new Set(["PICKUP_ONLY", "PICKUP_AND_DROP"]);
 const ARRIVAL_RADIUS_METERS = 100;
+const MAX_GARAGE_GPS_ACCURACY_METERS = 100;
+const MAX_GPS_AGE_MS = 120000;
 const PICKUP_OTP_TTL_MS = 15 * 60 * 1000;
 
 function isPickupBooking(booking) {
@@ -62,6 +64,55 @@ function distanceToPickupMeters(riderLocation, customerLocation) {
       customerLocation.longitude
     ) * 1000
   );
+}
+
+function garageLocation(booking) {
+  if (booking?.dealer_id?.latitude == null || booking?.dealer_id?.longitude == null) return null;
+  const latitude = Number(booking?.dealer_id?.latitude);
+  const longitude = Number(booking?.dealer_id?.longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return { latitude, longitude };
+}
+
+function deliveryLocation(booking) {
+  const point = booking?.pickupAndDropId;
+  if (point?.user_lat == null || point?.user_lng == null || point?.user_lat === "" || point?.user_lng === "") return null;
+  const latitude = Number(point?.user_lat);
+  const longitude = Number(point?.user_lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return { latitude, longitude };
+}
+
+function canStartDelivery(booking) {
+  const point = booking?.pickupAndDropId;
+  const sameRecordOwner = point && typeof point === "object" && point.user_id != null
+    ? String(point.user_id?._id || point.user_id) === String(booking.user_id?._id || booking.user_id) &&
+      String(point.dealer_id?._id || point.dealer_id) === String(booking.dealer_id?._id || booking.dealer_id) && Number(point.status) === 1
+    : true;
+  return Boolean(booking && booking.status === "ready_for_delivery" && booking.deliveryOtp != null &&
+    booking.payment_status === "completed" && booking.billStatus === "paid" &&
+    [undefined, null, "NOT_STARTED"].includes(booking.deliveryTransportStatus) &&
+    (booking.garageTransportStatus !== "TO_GARAGE") &&
+    (booking.garageTransportStartedAt == null || booking.garageTransportStatus === "ARRIVED_AT_GARAGE") &&
+    sameRecordOwner && deliveryLocation(booking));
+}
+
+function canPublishDeliveryLocation(booking) {
+  return Boolean(booking?.status === "ready_for_delivery" && booking.payment_status === "completed" && booking.billStatus === "paid" && booking.deliveryOtp != null && booking.deliveryTransportStatus === "OUT_FOR_DELIVERY");
+}
+
+function validGpsCapture(body = {}, now = new Date()) {
+  if (body.accuracy == null || body.capturedAt == null) return false;
+  const accuracy = Number(body.accuracy);
+  const capturedAt = new Date(body.capturedAt);
+  const age = now.getTime() - capturedAt.getTime();
+  return Number.isFinite(accuracy) && accuracy >= 0 && accuracy <= MAX_GARAGE_GPS_ACCURACY_METERS &&
+    Number.isFinite(capturedAt.getTime()) && age >= -10000 && age <= MAX_GPS_AGE_MS;
+}
+
+function canTransitionDuringGarageTransport(booking, nextStatus) {
+  if (booking?.garageTransportStatus !== "TO_GARAGE") return true;
+  return nextStatus === "confirmed" || ["cancelled", "user_cancelled"].includes(nextStatus);
 }
 
 function canMarkArrived(status) {
@@ -135,6 +186,9 @@ function pickupLocationSocketPayload({ bookingId, pickupStatus, location, update
     location: {
       latitude: location.latitude,
       longitude: location.longitude,
+      ...(Number.isFinite(Number(location.heading)) ? { heading: Number(location.heading) } : {}),
+      ...(Number.isFinite(Number(location.accuracy)) ? { accuracy: Number(location.accuracy) } : {}),
+      ...(location.capturedAt ? { capturedAt: location.capturedAt } : {}),
       updatedAt,
     },
     distanceMeters: Math.round(distanceMeters),
@@ -145,11 +199,19 @@ function pickupLocationSocketPayload({ bookingId, pickupStatus, location, update
 module.exports = {
   PICKUP_STATUSES,
   ARRIVAL_RADIUS_METERS,
+  MAX_GARAGE_GPS_ACCURACY_METERS,
+  MAX_GPS_AGE_MS,
   PICKUP_OTP_TTL_MS,
   isPickupBooking,
   normalizeLocation,
   pickupLocation,
   distanceToPickupMeters,
+  garageLocation,
+  deliveryLocation,
+  canStartDelivery,
+  canPublishDeliveryLocation,
+  validGpsCapture,
+  canTransitionDuringGarageTransport,
   canMarkArrived,
   canStartPickup,
   canMarkCustomerArrived,

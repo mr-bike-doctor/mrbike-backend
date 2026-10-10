@@ -37,8 +37,8 @@ async function authenticateActor(req, res) {
     return { role: "customer", id: String(id) };
   }
   if (decoded.user_type === 1 || decoded.user_type === 2 || decoded.id) {
-    const admin = await Admin.findById(id).select("_id status").lean();
-    if (admin?.status === "active") return { role: "admin", id: String(id) };
+    const admin = await Admin.findById(id).select("_id status role").lean();
+    if (admin?.status === "active") return { role: "admin", adminRole: admin.role, id: String(id) };
   }
   const dealer = await Vendor.findById(id).select("_id isBlocked").lean();
   if (!dealer || dealer.isBlocked) {

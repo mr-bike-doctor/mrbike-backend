@@ -299,6 +299,7 @@ const sensitiveRateLimit = require("./middlewares/rateLimits");
 const mongoose = require("mongoose");
 const Vendor = require("./models/dealerModel");
 const { isDealerBookable } = require("./helper/dealerStatus");
+const { createSocketAuthMiddleware, createBookingRoomJoinHandler } = require("./middlewares/socketAuth");
 const { ensureUserBikePlateIndexes } = require("./utils/userBikeIndexes");
 
 const app = express();
@@ -337,11 +338,17 @@ const io = new Server(server, {
 });
 app.set("io", io);
 
+// Socket authentication is separate from CORS: every realtime client must
+// present the same JWT used by the REST API before it can subscribe to rooms.
+io.use(createSocketAuthMiddleware());
+
 io.on("connection", (socket) => {
-  socket.on("ticket:join", ({ ticketId }) => {
+  socket.on("ticket:join", (payload = {}) => {
+    const { ticketId } = payload;
     if (ticketId) socket.join(String(ticketId));
   });
-  socket.on("ticket:leave", ({ ticketId }) => {
+  socket.on("ticket:leave", (payload = {}) => {
+    const { ticketId } = payload;
     if (ticketId) socket.leave(String(ticketId));
   });
 
@@ -357,6 +364,10 @@ io.on("connection", (socket) => {
     const dealerId = payload?.dealerId;
     if (!dealerId) return;
     try {
+      if (socket.data.actor?.role !== "dealer" || String(socket.data.actor.id) !== String(dealerId)) {
+        socket.emit("booking:joinDealerDenied", { dealerId, reason: "unauthorized" });
+        return;
+      }
       if (!mongoose.Types.ObjectId.isValid(String(dealerId))) return;
       const dealer = await Vendor.findById(dealerId)
         .select("online isBlocked isActive isDoc status registrationStatus dealerStatus")
@@ -372,14 +383,16 @@ io.on("connection", (socket) => {
     }
   });
 
-  // User joins their booking room to receive accept/reject/expired events
-  socket.on("booking:joinUser", ({ bookingId }) => {
-    if (bookingId) socket.join(`booking:${bookingId}`);
-  });
+  // Customer/provider tracking and booking updates share this room. Only a
+  // booking participant (or an active admin) may subscribe to its events.
+  socket.on("booking:joinUser", createBookingRoomJoinHandler());
 
   // Admin joins their personal room to receive support unread-count updates
-  socket.on("admin:join", ({ adminId }) => {
-    if (adminId) socket.join(`admin:${adminId}`);
+  socket.on("admin:join", (payload = {}) => {
+    const adminId = payload?.adminId;
+    if (socket.data.actor?.role === "admin" && String(socket.data.actor.id) === String(adminId)) {
+      socket.join(`admin:${adminId}`);
+    }
   });
 });
 

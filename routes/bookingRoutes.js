@@ -3,6 +3,8 @@ const router = express.Router();
 const { requireAdmin } = require("../middlewares/requireAdmin");
 const { requireCustomer, requireOwnedBooking } = require("../middlewares/customerAuth");
 const { requireBookingParticipant, requireOwnBookingList, requireActorRole, requireActorRoleAny } = require("../middlewares/bookingAuth");
+const { requireAdminBookingPermission } = require("../middlewares/adminBookingPermissions");
+const { getBookingAuditHistory } = require("../controller/bookingAuditController");
 const { getNotificationsByReceiverId } = require("../controller/notificationController");
 const { createS3Upload } = require("../utils/s3Upload");
 const { 
@@ -50,6 +52,9 @@ const {
     regeneratePickupOtp,
     verifyPickupOtp,
     completeBikePickup,
+    markGarageArrived,
+    startDelivery,
+    markDeliveryArrived,
 } = require("../controller/pickupLifecycleController");
 
 const MAX_COMPLETION_PHOTOS_PER_REQUEST = 6;
@@ -87,21 +92,22 @@ function handleCompletionPhotoUpload(req, res, next) {
 router.post('/addbooking/:id', requireAdmin, addbooking)
 
 // By Prashant 
-router.get('/getallbookings', requireAdmin, getallbookings)
+router.get('/getallbookings', requireAdmin, requireAdminBookingPermission("booking.view"), getallbookings)
+router.get('/:bookingId/audit', requireBookingParticipant(req => req.params.bookingId), requireAdminBookingPermission("booking.audit_read"), getBookingAuditHistory)
 
 
-router.get('/getuserbookings/:user_id', requireOwnBookingList, getuserbookings)
-router.get('/getbooking/:id', requireBookingParticipant(req => req.params.id), getbooking)
+router.get('/getuserbookings/:user_id', requireOwnBookingList, requireAdminBookingPermission("booking.view"), getuserbookings)
+router.get('/getbooking/:id', requireBookingParticipant(req => req.params.id), requireAdminBookingPermission("booking.view"), getbooking)
 router.delete('/deletebooking', requireAdmin, deletebooking)
-router.put('/updatebooking/:id', requireBookingParticipant(req => req.params.id), updateBookings)
+router.put('/updatebooking/:id', requireBookingParticipant(req => req.params.id), requireActorRole("dealer"), updateBookings)
 router.post('/createBooking', requireCustomer, createBooking)
-router.get('/getBookingDetails/:id', requireBookingParticipant(req => req.params.id), getBookingDetails)
-router.post('/updateBooking', requireBookingParticipant(req => req.body.bookingId), updateBooking)
+router.get('/getBookingDetails/:id', requireBookingParticipant(req => req.params.id), requireAdminBookingPermission("booking.view"), getBookingDetails)
+router.post('/updateBooking', requireBookingParticipant(req => req.body.bookingId), requireActorRoleAny("dealer", "admin"), requireAdminBookingPermission("booking.service_modify"), updateBooking)
 // Towing charge — dealer handling the booking or an admin, pre-payment only.
 // Recomputes the whole pricing breakdown server-side; see controller/booking.js.
-router.post('/:bookingId/towing-charge', requireBookingParticipant(req => req.params.bookingId), requireActorRoleAny("dealer", "admin"), updateTowingCharge)
+router.post('/:bookingId/towing-charge', requireBookingParticipant(req => req.params.bookingId), requireActorRoleAny("dealer", "admin"), requireAdminBookingPermission("booking.charge_review"), updateTowingCharge)
 router.patch('/:bookingId/operational-details', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), updateBookingOperationalDetails)
-router.post('/updateBookingStatus/:bookingId/status', requireBookingParticipant(req => req.params.bookingId), updateBookingStatus)
+router.post('/updateBookingStatus/:bookingId/status', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), updateBookingStatus)
 router.post('/sendBookingOTP', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), sendBookingOTP)
 router.post('/sendBookingMobile', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), sendOtpToMobile)
 router.post('/verifyBookingOTP', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), verifyBookingOTP)
@@ -117,6 +123,9 @@ router.get('/:bookingId/pickup/otp', requireBookingParticipant(req => req.params
 router.post('/:bookingId/pickup/resend-otp', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), regeneratePickupOtp);
 router.post('/:bookingId/pickup/verify-otp', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), verifyPickupOtp);
 router.post('/:bookingId/pickup/complete', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), completeBikePickup);
+router.post('/:bookingId/pickup/garage-arrived', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), markGarageArrived);
+router.post('/:bookingId/delivery/start', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), startDelivery);
+router.post('/:bookingId/delivery/arrived', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), markDeliveryArrived);
 router.post('/addNote', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), addNoteToBooking);
 router.get('/getNotes/:bookingId', requireBookingParticipant(req => req.params.bookingId), getNotesFromBooking);
 router.put('/updateNote', requireBookingParticipant(req => req.body.bookingId), requireActorRole("dealer"), updateNoteInBooking);
@@ -133,7 +142,7 @@ router.post('/:bookingId/service-complete', requireBookingParticipant(req => req
 // admins, for the booking details screen in the admin panel.
 // See controller/booking.js for why `completionPhotos` is `select: false`.
 router.post('/:bookingId/completion-photos', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), handleCompletionPhotoUpload, uploadCompletionPhotos);
-router.get('/:bookingId/completion-photos', requireBookingParticipant(req => req.params.bookingId), requireActorRoleAny("dealer", "admin"), getCompletionPhotos);
+router.get('/:bookingId/completion-photos', requireBookingParticipant(req => req.params.bookingId), requireActorRoleAny("dealer", "admin"), requireAdminBookingPermission("booking.view"), getCompletionPhotos);
 router.delete('/:bookingId/completion-photos/:photoId', requireBookingParticipant(req => req.params.bookingId), requireActorRole("dealer"), deleteCompletionPhoto);
 // Edit services / odometer / notes between Complete Service and delivery.
 // Rules: services/postServiceEdit.js. Dealer-only — the owning garage.

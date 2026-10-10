@@ -7,18 +7,9 @@ const Vendor  = require("../models/dealerModel")
 
 async function gettracking(req, res) {
     try{
-      const data = jwt_decode(req.headers.token);
-      const user_id = data.user_id;
-      const user_type = data.user_type;
-      const type = data.type;
-        if (user_id == null || user_type != 1 && user_type != 4) 
-        {
-          var response = {
-            status: 401,
-            message: "admin is un-authorised !",
-          };
-          return res.status(401).send(response);
-        }
+        // The route has already verified the active actor and booking
+        // participation. Do not decode a second token representation here.
+        if (!req.auth) return res.status(401).json({ success: false, message: "Authentication required" });
 
         // let bookings = await booking.findById(req.params.id);
         let bookings = await booking.findById(req.params.id)
@@ -137,18 +128,9 @@ async function updatetracking(req, res){
 
 async function getAlltracking(req, res) {
   try{
-    const data = jwt_decode(req.headers.token);
-    const user_id = data.user_id;
-    const user_type = data.user_type;
-    const type = data.type;
-      if (user_id == null || user_type != 1 && user_type != 3 && user_type != 4) 
-      {
-        var response = {
-          status: 401,
-          message: "admin is un-authorised !",
-        };
-        return res.status(401).send(response);
-      }
+      // requireAdmin and the route-level live_gps permission have already
+      // authenticated and authorized this request.
+      if (!req.admin) return res.status(401).json({ success: false, message: "Authentication required" });
 
       // const responses = await Tracking.find().populate({path:"service_id",select: ['name', 'image', 'description']}).populate({path:"user_id",select: ['first_name', 'last_name', 'phone','address','city']}).sort({"_id":-1});
       const responses = await Tracking.find(req.query)

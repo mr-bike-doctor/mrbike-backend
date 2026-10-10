@@ -12,7 +12,8 @@ const SERVICE_FINISHED_STATUSES = new Set([
   "completed", "awaiting_payment", "payment_selected", "ready_for_delivery", "delivered",
 ]);
 const PICKUP_COMPLETED_STATUSES = new Set([
-  "pickedup", "completed", "PICKUP_OTP_VERIFIED", "BIKE_PICKED_UP",
+  "arriving", "arrived", "pickedup", "completed", "PICKUP_STARTED",
+  "RIDER_NEARBY", "ARRIVED", "PICKUP_OTP_VERIFIED", "BIKE_PICKED_UP",
 ]);
 
 class BookingOperationalUpdateError extends Error {
@@ -48,8 +49,7 @@ function pricingIsClosed(booking) {
     booking?.billGenerated === true ||
     booking?.billStatus === "paid" ||
     booking?.payment_status === "completed" ||
-    booking?.payment_method ||
-    ["payment_selected", "ready_for_delivery"].includes(booking?.status) ||
+    booking?.status === "ready_for_delivery" ||
     TERMINAL_STATUSES.has(booking?.status)
   );
 }

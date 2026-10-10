@@ -2014,9 +2014,14 @@ async function verifyDocument(req, res) {
 
     if (anyRejected) {
       updates["formProgress.completedSteps.documents"] = false;
+      updates["isVerify"] = false;
+      updates["status.isVerified"] = false;
     } else if (allVerified) {
       updates["formProgress.completedSteps.documents"] = true;
       updates["completionTimestamps.documents"] = new Date();
+      updates["isVerify"] = true;
+      updates["status.isVerified"] = true;
+      updates["isDoc"] = true;
     }
 
     // Open/close the post-approval re-verification cycle. While it is open the
@@ -2041,7 +2046,7 @@ async function verifyDocument(req, res) {
 
     const vendor = await Vendor.findByIdAndUpdate(id, updates, {
       new: true,
-    }).select("documentVerification documentRequests reVerification formProgress device_token ftoken");
+    }).select("documentVerification documentRequests reVerification formProgress device_token ftoken isVerify status isDoc");
 
     if (!vendor) {
       return res
@@ -2103,6 +2108,8 @@ async function verifyDocument(req, res) {
       documentVerification: vendor.documentVerification,
       documentRequests: vendor.documentRequests,
       formProgress: vendor.formProgress,
+      isVerify: vendor.isVerify,
+      status: vendor.status,
     });
   } catch (error) {
     res
@@ -2134,6 +2141,8 @@ async function approveDealer(req, res) {
       registrationStatus: "Approved",
       approvedAt: new Date(),
       isActive: true,
+      isVerify: true,
+      isDoc: true,
       "status.adminApproved": true,
       "status.isActive": true,
       "status.isVerified": true,
@@ -2141,7 +2150,18 @@ async function approveDealer(req, res) {
       // otherwise documents left at "pending" would keep the dealer stuck on
       // the Waiting For Admin Review screen after approval.
       "reVerification.active": false,
+      "formProgress.completedSteps.documents": true,
+      "completionTimestamps.documents": new Date(),
     };
+
+    // Auto-verify all documents that were uploaded and not rejected/requested
+    const docKeys = ["aadharFront", "aadharBack", "pan", "shop", "face", "passbook"];
+    const existingDV = vendorExists.documentVerification || {};
+    docKeys.forEach((key) => {
+      if (existingDV[key] !== "rejected" && existingDV[key] !== "requested") {
+        updateData[`documentVerification.${key}`] = "verified";
+      }
+    });
     console.log("Update object", updateData);
 
     const vendor = await Vendor.findByIdAndUpdate(req.params.id, updateData, { new: true });

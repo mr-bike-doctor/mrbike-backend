@@ -22,6 +22,12 @@ const {
   canRegeneratePickupOtp,
   canCompleteBikePickup,
   pickupLocationSocketPayload,
+  garageLocation,
+  deliveryLocation,
+  canStartDelivery,
+  canPublishDeliveryLocation,
+  validGpsCapture,
+  canTransitionDuringGarageTransport,
 } = require("../services/pickupLifecycle");
 
 const CUSTOMER = new mongoose.Types.ObjectId();
@@ -77,6 +83,35 @@ async function run() {
   };
   assert.strictEqual(isPickupBooking(confirmedPickup), true);
   assert.strictEqual(canStartPickup(confirmedPickup), true, "confirmed pickup can start");
+  const garage = { dealer_id: { latitude: 17.4, longitude: 78.5 } };
+  assert.deepStrictEqual(garageLocation(garage), { latitude: 17.4, longitude: 78.5 });
+  assert.strictEqual(garageLocation({ dealer_id: { latitude: null, longitude: null } }), null, "missing garage coordinates are never invented");
+  const deliveryBooking = {
+    status: "ready_for_delivery", deliveryOtp: 4321, payment_status: "completed", billStatus: "paid", deliveryTransportStatus: "NOT_STARTED",
+    transportOption: "PICKUP_ONLY", pickupStatus: PICKUP_STATUSES.BIKE_PICKED_UP,
+    pickupAndDropId: { user_lat: 12.9716, user_lng: 77.5946, user_id: CUSTOMER, dealer_id: DEALER, status: 1 },
+    user_id: CUSTOMER, dealer_id: { _id: DEALER, latitude: 17.4, longitude: 78.5 }, garageTransportStatus: "ARRIVED_AT_GARAGE",
+  };
+  assert.deepStrictEqual(deliveryLocation(deliveryBooking), { latitude: 12.9716, longitude: 77.5946 });
+  assert.strictEqual(canStartDelivery(deliveryBooking), true, "eligible paid pickup booking can start delivery after garage arrival");
+  assert.strictEqual(canStartDelivery({ ...deliveryBooking, garageTransportStatus: "TO_GARAGE" }), false, "delivery cannot start during garage transport");
+  assert.strictEqual(canStartDelivery({ ...deliveryBooking, garageTransportStatus: "NOT_STARTED", garageTransportStartedAt: new Date() }), false, "a started garage leg must complete before delivery");
+  assert.strictEqual(canStartDelivery({ ...deliveryBooking, garageTransportStatus: "NOT_STARTED", garageTransportStartedAt: null }), true, "legacy bookings with no garage leg state retain delivery compatibility");
+  assert.strictEqual(canStartDelivery({ ...deliveryBooking, deliveryOtp: null }), false, "delivery cannot start before existing payment flow issues the OTP");
+  assert.strictEqual(canStartDelivery({ ...deliveryBooking, pickupAndDropId: { user_lat: null, user_lng: null } }), false, "missing destination coordinates are not inferred");
+  assert.strictEqual(canStartDelivery({ ...deliveryBooking, pickupAndDropId: { ...deliveryBooking.pickupAndDropId, user_id: WRONG_DEALER } }), false, "destination record must belong to booking customer");
+  assert.strictEqual(canPublishDeliveryLocation({ ...deliveryBooking, deliveryTransportStatus: "OUT_FOR_DELIVERY" }), true);
+  assert.strictEqual(canPublishDeliveryLocation({ ...deliveryBooking, status: "cancelled", deliveryTransportStatus: "OUT_FOR_DELIVERY" }), false, "cancelled booking cannot publish GPS");
+  assert.strictEqual(canPublishDeliveryLocation({ ...deliveryBooking, deliveryTransportStatus: "ARRIVED_AT_CUSTOMER" }), false, "arrival ends live GPS publishing");
+  const captureTime = new Date();
+  assert.strictEqual(validGpsCapture({ accuracy: 25, capturedAt: captureTime.toISOString() }, captureTime), true);
+  assert.strictEqual(validGpsCapture({ accuracy: 101, capturedAt: captureTime.toISOString() }, captureTime), false, "inaccurate GPS is rejected");
+  assert.strictEqual(validGpsCapture({ accuracy: 25, capturedAt: new Date(captureTime.getTime() - 121000).toISOString() }, captureTime), false, "stale GPS is rejected");
+  assert.strictEqual(validGpsCapture({ accuracy: 25, capturedAt: new Date(captureTime.getTime() + 11000).toISOString() }, captureTime), false, "future GPS is rejected");
+  assert.strictEqual(validGpsCapture({ accuracy: null, capturedAt: captureTime.toISOString() }, captureTime), false, "missing GPS accuracy is rejected");
+  assert.strictEqual(canTransitionDuringGarageTransport({ garageTransportStatus: "TO_GARAGE" }, "awaiting_payment"), false);
+  assert.strictEqual(canTransitionDuringGarageTransport({ garageTransportStatus: "TO_GARAGE" }, "confirmed"), true);
+  assert.strictEqual(canTransitionDuringGarageTransport({ garageTransportStatus: "ARRIVED_AT_GARAGE" }, "awaiting_payment"), true);
 
   const normalBooking = {
     transportOption: "SELF_VISIT",
@@ -95,13 +130,16 @@ async function run() {
   const livePayload = pickupLocationSocketPayload({
     bookingId: BOOKING,
     pickupStatus: PICKUP_STATUSES.PICKUP_STARTED,
-    location: { latitude: 12.9716, longitude: 77.5946 },
+    location: { latitude: 12.9716, longitude: 77.5946, accuracy: 8, heading: 241, capturedAt: new Date("2026-09-18T09:59:58.000Z") },
     updatedAt: new Date("2026-09-18T10:00:00.000Z"),
     distanceMeters: 125.6,
   });
   assert.strictEqual(livePayload.bookingId, String(BOOKING));
   assert.strictEqual(livePayload.distanceMeters, 126);
   assert.strictEqual(livePayload.nearby, false);
+  assert.strictEqual(livePayload.location.accuracy, 8);
+  assert.strictEqual(livePayload.location.heading, 241);
+  assert.strictEqual(livePayload.location.capturedAt.toISOString(), "2026-09-18T09:59:58.000Z");
   assert.strictEqual(livePayload.dealer, undefined, "location event exposes no dealer PII");
   assert.strictEqual(canMarkCustomerArrived(confirmedPickup), false, "pickup booking must use GPS arrival");
   assert.strictEqual(isPickupBooking({ transportOption: "DROP_ONLY", pickupAndDropId: BOOKING }), false);
