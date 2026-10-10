@@ -42,8 +42,8 @@ async function verifyRealTransactionIfAvailable() {
 
   const bookingCollection = Booking.collection;
   const auditCollection = AdminBookingAudit.collection;
-  await bookingCollection.createCollection().catch((error) => { if (error.codeName !== "NamespaceExists") throw error; });
-  await auditCollection.createCollection().catch((error) => { if (error.codeName !== "NamespaceExists") throw error; });
+  await Booking.createCollection().catch((error) => { if (error.codeName !== "NamespaceExists") throw error; });
+  await AdminBookingAudit.createCollection().catch((error) => { if (error.codeName !== "NamespaceExists") throw error; });
 
   const booking = new Booking({
     user_id: USER_ID, dealer_id: DEALER_ID, userBike_id: BIKE_ID,
