@@ -266,7 +266,8 @@ const bookingSchema = new mongoose.Schema(
 
     // 🔄 replaced single 'otp' with two distinct OTPs
     pickupOtp: { type: Number, default: null, select: false },
-    deliveryOtp: { type: Number, default: null },
+    deliveryOtp: { type: Number, default: null, select: false },
+    deliveryOtpExpiresAt: { type: Date, default: null, select: false },
 
     // Legacy fields — kept for backward compatibility with code that reads
     // them directly (wallet settlement, admin finance/reporting). Populated
@@ -460,6 +461,18 @@ const bookingSchema = new mongoose.Schema(
     scheduleDate: { type: String, default: null },   // e.g. "2026-05-10"
     timeSlot: { type: String, default: null },        // e.g. "10:00 AM - 12:00 PM"
     pickupAddress: { type: String, default: null },   // e.g. "123 MG Road, Bangalore"
+    // Booking-scoped support corrections. Keep these on the booking instead
+    // of mutating PickupnDrop, which can be referenced by multiple bookings.
+    pickupLocation: {
+      address: { type: String, default: null },
+      latitude: { type: Number, default: null },
+      longitude: { type: Number, default: null },
+    },
+    deliveryLocation: {
+      address: { type: String, default: null },
+      latitude: { type: Number, default: null },
+      longitude: { type: Number, default: null },
+    },
 
     bookingId: { type: String, unique: true },
 

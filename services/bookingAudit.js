@@ -41,8 +41,20 @@ async function saveBookingWithAdminAudit(document, auditEvent) {
   const mongoose = require("mongoose");
   const AdminBookingAudit = require("../models/AdminBookingAudit");
   const session = await mongoose.startSession();
+  const wasNew = document.isNew;
+  const modifiedPaths = document.modifiedPaths();
+  let transactionAttempt = 0;
   try {
     await session.withTransaction(async () => {
+      // The MongoDB driver may rerun this callback after a transient
+      // transaction error. Mongoose marks the document clean after the first
+      // save even though that attempt was rolled back, so restore the original
+      // dirty state before each retry.
+      if (transactionAttempt > 0) {
+        if (wasNew) document.$isNew = true;
+        else modifiedPaths.forEach((path) => document.markModified(path));
+      }
+      transactionAttempt += 1;
       await document.save({ session });
       await AdminBookingAudit.create([auditEvent], { session });
     });

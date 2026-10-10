@@ -72,7 +72,18 @@ const {
 const { verifyPickupOtp } = require("./pickupLifecycleController");
 const { canTransitionBookingStatus } = require("../services/bookingStatusPolicy");
 const { createAdminBookingAuditEvent, saveBookingWithAdminAudit, correlationId, snapshotFields } = require("../services/bookingAudit");
-const { removeAdminBookingOtpFields } = require("../services/bookingResponsePrivacy");
+const { removeBookingOtpFields, removeAdminBookingOtpFields } = require("../services/bookingResponsePrivacy");
+const {
+  MAX_DELIVERY_OTP_ATTEMPTS,
+  MAX_DELIVERY_OTP_REGENERATIONS,
+  generateDeliveryOtp,
+  deliveryOtpExpiry,
+  deliveryOtpState,
+  confirmCashReceipt: confirmCashReceiptAtomically,
+  recordInvalidDeliveryOtp,
+  consumeDeliveryOtp,
+  regenerateDeliveryOtp: regenerateDeliveryOtpAtomically,
+} = require("../services/deliveryOtpLifecycle");
 const {
   resolveCancellationReason,
   canCustomerCancel,
@@ -133,16 +144,15 @@ async function getbooking(req, res) {
         ? { _id: req.params.id, dealer_id: req.auth.id }
         : { _id: req.params.id, user_id: req.auth.id };
     let bookingQuery = booking.findOne(ownerFilter);
-    if (req.auth?.role === "admin") bookingQuery = bookingQuery.select("-pickupOtp -pickupOtpExpiresAt -deliveryOtp");
+    if (req.auth?.role === "customer") bookingQuery = bookingQuery.select("+deliveryOtp");
     let bookingresponce = await bookingQuery
       .populate({ path: "service_id", select: ['name', 'image', 'description'] })
       .populate({ path: "created_by", select: ['first_name', 'email', 'last_name', 'phone', 'image', 'address', 'city'] })
     // .populate({path:"service_provider_id",select: ['name', 'email', 'phone']})
 
     if (bookingresponce) {
-      if (req.auth?.role === "admin") {
-        const safeData = removeAdminBookingOtpFields(bookingresponce.toObject());
-        bookingresponce = safeData;
+      if (req.auth?.role !== "customer") {
+        bookingresponce = removeBookingOtpFields(bookingresponce.toObject());
       }
       var response = {
         status: 200,
@@ -227,6 +237,7 @@ const getuserbookings = async (req, res) => {
     const [total, userBookings] = await Promise.all([
       booking.countDocuments(filter),
       booking.find(filter)
+        .select(req.auth?.role === "customer" ? "+deliveryOtp" : "-deliveryOtp")
         .populate({
         path: "services",
         model: "AdminService",
@@ -286,7 +297,7 @@ const getuserbookings = async (req, res) => {
       // Add pricing information to each booking
       // Priority: Bill data > Booking totalBill > 0
       const enrichedBookings = userBookings.map(rawBooking => {
-        const b = req.auth?.role === "admin" ? removeAdminBookingOtpFields(rawBooking) : rawBooking;
+        const b = req.auth?.role === "customer" ? rawBooking : removeBookingOtpFields(rawBooking);
         const bill = billMap[b._id.toString()];
         
         // Use bill data if available, otherwise use booking's totalBill
@@ -329,7 +340,7 @@ const getuserbookings = async (req, res) => {
       
       // Fallback: Use booking's totalBill if bill fetch fails
       const enrichedBookings = userBookings.map(rawBooking => {
-        const b = req.auth?.role === "admin" ? removeAdminBookingOtpFields(rawBooking) : rawBooking;
+        const b = req.auth?.role === "customer" ? rawBooking : removeBookingOtpFields(rawBooking);
         return {
           ...b,
           subtotal: b.totalBill || 0,
@@ -926,7 +937,6 @@ async function createBooking(req, res) {
     const pickupOtp = pickupRequest
       ? (/^\d{4}$/.test(String(pickupRequest.otp ?? "")) ? pickupRequest.otp : genOtp())
       : null;
-    const deliveryOtp = genOtp();
 
     // ── 4. Pre-save payload log ───────────────────────────────────────────────
     console.log('[createBooking] PRE-SAVE payload:', JSON.stringify({
@@ -954,7 +964,6 @@ async function createBooking(req, res) {
       towingRequired: resolvedTowingRequired,
       towingNote: resolvedTowingNote,
       pickupOtp,
-      deliveryOtp,
       status: "pending",
       dealerResponseStatus: "awaiting",
       timerExpiresAt: new Date(Date.now() + 2 * 60 * 1000),
@@ -1060,7 +1069,6 @@ async function createBooking(req, res) {
       message: "Booking created successfully",
       data: bookingResponse,
       pricing: breakdown,
-      deliveryOtp,
       timerExpiresAt: newBooking.timerExpiresAt,
       dealerResponseStatus: newBooking.dealerResponseStatus,
     });
@@ -1098,7 +1106,7 @@ async function getBookingDetails(req, res) {
     // Legacy SELF_VISIT bookings still use this customer-visible visit OTP.
     // Tracked PICKUP bookings are sanitized below and use the narrow,
     // ARRIVED-only customer OTP endpoint instead.
-    if (req.auth?.role === "customer") bookingQuery.select("+pickupOtp");
+    if (req.auth?.role === "customer") bookingQuery.select("+pickupOtp +deliveryOtp");
 
     const bookingData = await bookingQuery
       .populate("user_id", "first_name last_name phone email image address city")
@@ -1161,7 +1169,7 @@ async function getBookingDetails(req, res) {
       delete result.pickupOtp;
       delete result.pickupOtpExpiresAt;
     }
-    const responseResult = req.auth?.role === "admin" ? removeAdminBookingOtpFields(result) : result;
+    const responseResult = req.auth?.role === "customer" ? result : removeBookingOtpFields(result);
 
     console.log("Returning booking details with grandTotal:", grandTotal);
     res.status(200).json({ success: true, data: responseResult });
@@ -2215,6 +2223,11 @@ const verifyBookingOTP = async (req, res) => {
       });
     }
 
+    if (stage === "delivery") return verifyDeliveryOtp(req, res);
+    if (stage !== "pickup") {
+      return res.status(400).json({ success: false, message: "stage must be 'pickup' or 'delivery'" });
+    }
+
     // Keep the legacy URL compatible, but route pickup verification through
     // the guarded lifecycle so it cannot bypass ARRIVED or ownership checks.
     if (stage === "pickup") {
@@ -3148,6 +3161,14 @@ const confirmCashReceived = async (req, res) => {
       });
     }
 
+    if (bookingDoc.status === "ready_for_delivery" && bookingDoc.payment_status === "completed" && bookingDoc.payment_verified) {
+      return res.status(200).json({
+        success: true,
+        message: "Cash was already confirmed. Delivery OTP remains valid for the customer.",
+        data: { bookingId, status: "ready_for_delivery" },
+      });
+    }
+
     // Status guard
     if (bookingDoc.status !== "payment_selected") {
       return res.status(400).json({
@@ -3156,16 +3177,34 @@ const confirmCashReceived = async (req, res) => {
       });
     }
 
-    const freshOtp = genOtp();
+    const freshOtp = generateDeliveryOtp();
+    const confirmedBooking = await confirmCashReceiptAtomically(booking, {
+      bookingId,
+      dealerId: bookingDoc.dealer_id,
+      otp: freshOtp,
+    });
+    if (!confirmedBooking) {
+      // Another request may have claimed this cash confirmation already. A
+      // repeat is successful but must not issue another OTP or repeat effects.
+      const alreadyConfirmed = await booking.exists({
+        _id: bookingId,
+        dealer_id: bookingDoc.dealer_id,
+        payment_method: "CASH",
+        payment_status: "completed",
+        payment_verified: true,
+        status: "ready_for_delivery",
+      });
+      if (alreadyConfirmed) {
+        return res.status(200).json({
+          success: true,
+          message: "Cash was already confirmed. Delivery OTP remains valid for the customer.",
+          data: { bookingId, status: "ready_for_delivery" },
+        });
+      }
+      return res.status(409).json({ success: false, message: "Cash confirmation is no longer available for this booking" });
+    }
 
-    bookingDoc.payment_status   = "completed";
-    bookingDoc.payment_verified = true;
-    bookingDoc.deliveryOtp      = freshOtp;
-    bookingDoc.status           = "ready_for_delivery";
-    bookingDoc.billStatus       = "paid";
-    await bookingDoc.save();
-
-    console.log(`[CASH-CONFIRM] Booking ${bookingId} → ready_for_delivery | OTP: ${freshOtp}`);
+    console.log(`[CASH-CONFIRM] Booking ${bookingId} → ready_for_delivery`);
 
     // Bill generation — reuse existing generateBill
     try {
@@ -3255,7 +3294,7 @@ const verifyDeliveryOtp = async (req, res) => {
       return res.status(400).json({ success: false, message: "OTP must be exactly 4 digits" });
     }
 
-    const bookingDoc = await booking.findById(bookingId);
+    const bookingDoc = await booking.findById(bookingId).select("+deliveryOtp +deliveryOtpExpiresAt");
     if (!bookingDoc) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
@@ -3281,7 +3320,7 @@ const verifyDeliveryOtp = async (req, res) => {
     }
 
     // Lockout guard — checked before touching DB again
-    if (bookingDoc.otp_failed_attempts >= 5) {
+    if ((bookingDoc.otp_failed_attempts || 0) >= MAX_DELIVERY_OTP_ATTEMPTS) {
       return res.status(423).json({
         success: false,
         message: "OTP verification locked after 5 failed attempts. Please contact support.",
@@ -3289,11 +3328,28 @@ const verifyDeliveryOtp = async (req, res) => {
       });
     }
 
-    // OTP presence guard
-    if (bookingDoc.deliveryOtp == null) {
+    const otpState = bookingDoc.payment_method === "CASH" ? deliveryOtpState(bookingDoc) : null;
+    if (bookingDoc.deliveryOtp == null || otpState === "MISSING") {
       return res.status(409).json({
         success: false,
         message: "Delivery OTP not present or already used.",
+      });
+    }
+
+    // Pre-expiry legacy OTPs stay usable after a controlled regeneration only;
+    // never invent an expiry for existing records or silently extend them.
+    if (otpState === "REGENERATION_REQUIRED") {
+      return res.status(409).json({
+        success: false,
+        code: "DELIVERY_OTP_REGENERATION_REQUIRED",
+        message: "This booking needs a controlled OTP regeneration before delivery verification.",
+      });
+    }
+    if (otpState === "EXPIRED") {
+      return res.status(410).json({
+        success: false,
+        code: "DELIVERY_OTP_EXPIRED",
+        message: "Delivery OTP expired. Generate a new OTP before verification.",
       });
     }
 
@@ -3301,9 +3357,16 @@ const verifyDeliveryOtp = async (req, res) => {
 
     // ── OTP MISMATCH ───────────────────────────────────────────────────────────
     if (incoming !== storedOtp) {
-      bookingDoc.otp_failed_attempts += 1;
-      await bookingDoc.save();
-      const remaining = 5 - bookingDoc.otp_failed_attempts;
+      const attempt = await recordInvalidDeliveryOtp(booking, {
+        bookingId,
+        dealerId: bookingDoc.dealer_id,
+        paymentMethod: bookingDoc.payment_method,
+        storedOtp: bookingDoc.deliveryOtp,
+      });
+      if (!attempt) {
+        return res.status(409).json({ success: false, message: "OTP changed, expired, or was already used. Refresh booking and try again." });
+      }
+      const remaining = Math.max(0, MAX_DELIVERY_OTP_ATTEMPTS - attempt.otp_failed_attempts);
       return res.status(401).json({
         success: false,
         message: `Invalid OTP. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`,
@@ -3312,17 +3375,19 @@ const verifyDeliveryOtp = async (req, res) => {
     }
 
     // ── OTP MATCHED — close the booking ───────────────────────────────────────
-    bookingDoc.deliveryOtp          = null;
-    bookingDoc.otp_verified         = true;
-    bookingDoc.delivered_at         = new Date();
-    bookingDoc.status               = "delivered";
-    bookingDoc.deliveryTransportStatus = "DELIVERED";
-    bookingDoc.deliveryTransportCompletedAt = new Date();
+    const deliveredBooking = await consumeDeliveryOtp(booking, {
+      bookingId,
+      dealerId: bookingDoc.dealer_id,
+      paymentMethod: bookingDoc.payment_method,
+      storedOtp: bookingDoc.deliveryOtp,
+    });
+    if (!deliveredBooking) {
+      return res.status(409).json({ success: false, message: "OTP expired, changed, or delivery was already recorded." });
+    }
+
     // Delivery is the final lifecycle gate. Payment and invoice guards above
     // have already succeeded before a delivery OTP can be issued/verified.
-    bookingDoc.reviewStatus         = "pending";
-    bookingDoc.reviewEligibleAt     = new Date();
-    await bookingDoc.save();
+    Object.assign(bookingDoc, deliveredBooking.toObject());
 
     console.log(`[VERIFY-OTP] Booking ${bookingId} → delivered`);
 
@@ -3427,7 +3492,7 @@ const regenerateDeliveryOtp = async (req, res) => {
     }
 
     // Rate limit guard
-    if (bookingDoc.otp_regen_count >= 5) {
+    if ((bookingDoc.otp_regen_count || 0) >= MAX_DELIVERY_OTP_REGENERATIONS) {
       return res.status(429).json({
         success: false,
         message: "Maximum OTP regeneration limit (5) reached. Please contact support.",
@@ -3436,10 +3501,27 @@ const regenerateDeliveryOtp = async (req, res) => {
       });
     }
 
-    const freshOtp = genOtp();
-    bookingDoc.deliveryOtp      = freshOtp;
-    bookingDoc.otp_regen_count += 1;
-    await bookingDoc.save();
+    const isCashBooking = bookingDoc.payment_method === "CASH";
+    const freshOtp = isCashBooking ? generateDeliveryOtp() : genOtp();
+    const regeneratedBooking = await regenerateDeliveryOtpAtomically(booking, {
+      bookingId,
+      dealerId: bookingDoc.dealer_id,
+      otp: freshOtp,
+      ...(isCashBooking ? { expiresAt: deliveryOtpExpiry(), resetAttempts: true } : {}),
+    });
+    if (!regeneratedBooking) {
+      const latest = await booking.findById(bookingId).select("otp_regen_count").lean();
+      if (latest && (latest.otp_regen_count || 0) >= MAX_DELIVERY_OTP_REGENERATIONS) {
+        return res.status(429).json({
+          success: false,
+          message: "Maximum OTP regeneration limit (5) reached. Please contact support.",
+          regens_used: MAX_DELIVERY_OTP_REGENERATIONS,
+          regens_remaining: 0,
+        });
+      }
+      return res.status(409).json({ success: false, message: "OTP could not be regenerated because the booking changed. Refresh and try again." });
+    }
+    Object.assign(bookingDoc, regeneratedBooking.toObject());
 
     console.log(`[REGEN-OTP] Booking ${bookingId} | regen #${bookingDoc.otp_regen_count}`);
 

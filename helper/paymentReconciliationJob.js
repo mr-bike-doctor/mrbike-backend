@@ -89,7 +89,7 @@ async function claimTask() {
 
 async function processTask(task) {
   const payment = task.payment_id ? await Payment.findById(task.payment_id) : null;
-  const booking = await Booking.findById(task.booking_id);
+  const booking = await Booking.findById(task.booking_id).select("+deliveryOtp +deliveryOtpExpiresAt");
   if (!booking) throw new Error("Booking missing during reconciliation");
 
   if (task.taskType !== "INVOICE_PAYMENT_MISMATCH" && (!payment || payment.order_status !== "SUCCESS")) {

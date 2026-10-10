@@ -41,7 +41,7 @@ function locationWasProvided(body = {}) {
 
 async function loadPickupBooking(bookingId) {
   return Booking.findById(bookingId)
-    .select("+pickupOtp +pickupOtpExpiresAt")
+    .select("+pickupOtp +pickupOtpExpiresAt +deliveryOtp +deliveryOtpExpiresAt")
     .populate("pickupAndDropId", "user_lat user_lng user_id dealer_id status")
     .populate("dealer_id", "latitude longitude shopName");
 }

@@ -20,10 +20,42 @@ async function verifyUnsupportedFailsClosed() {
     endSession: async () => {},
   });
   try {
-    await assert.rejects(saveBookingWithAdminAudit({ save: async () => { bookingSaveCalls += 1; } }, {}), /replica set member/);
+    await assert.rejects(saveBookingWithAdminAudit({ isNew: false, modifiedPaths: () => ["status"], markModified() {}, save: async () => { bookingSaveCalls += 1; } }, {}), /replica set member/);
     assert.strictEqual(bookingSaveCalls, 0, "booking save must not run when transaction support is unavailable");
   } finally {
     mongoose.startSession = originalStartSession;
+  }
+}
+
+async function verifyTransientRetryReappliesChanges() {
+  const originalStartSession = mongoose.startSession;
+  const originalAuditCreate = AdminBookingAudit.create;
+  let dirty = true;
+  let saveCalls = 0;
+  let auditCalls = 0;
+  const document = {
+    isNew: false,
+    modifiedPaths: () => dirty ? ["status"] : [],
+    markModified(path) { if (path === "status") dirty = true; },
+    async save() { assert(dirty, "each transaction attempt must reapply booking changes"); saveCalls += 1; dirty = false; },
+  };
+  mongoose.startSession = async () => ({
+    withTransaction: async (callback) => {
+      await callback();
+      // Simulate the driver retrying its callback after an aborted attempt;
+      // Mongoose's first save has already made the document appear clean.
+      await callback();
+    },
+    endSession: async () => {},
+  });
+  AdminBookingAudit.create = async () => { auditCalls += 1; };
+  try {
+    await saveBookingWithAdminAudit(document, {});
+    assert.strictEqual(saveCalls, 2);
+    assert.strictEqual(auditCalls, 2);
+  } finally {
+    mongoose.startSession = originalStartSession;
+    AdminBookingAudit.create = originalAuditCreate;
   }
 }
 
@@ -55,20 +87,33 @@ async function verifyRealTransactionIfAvailable() {
     after: { status: "confirmed" }, requestId: String(TEST_RUN),
   };
 
+  let stage = "commit booking and audit";
   try {
-    await saveBookingWithAdminAudit(booking, validAudit);
+    // Seed the booking outside the transaction, like the real mutation path:
+    // this specifically tests an existing booking update plus its audit row.
+    await booking.save();
+    const committedChange = await Booking.findById(booking._id);
+    committedChange.status = "confirmed";
+    await saveBookingWithAdminAudit(committedChange, validAudit);
     const savedAudit = await AdminBookingAudit.findOne({ bookingId: booking._id }).lean();
     assert(savedAudit, "booking update and audit record commit together");
+    assert.strictEqual((await Booking.findById(booking._id).lean()).status, "confirmed", "booking commits with audit record");
 
+    stage = "induce audit insert failure and verify rollback";
     const changed = await Booking.findById(booking._id);
     changed.status = "completed";
-    const invalidAudit = { ...validAudit, action: undefined, requestId: `${TEST_RUN}-invalid` };
+    // Reuse the committed audit _id so MongoDB rejects the second audit insert
+    // after the booking update has already been attempted in the transaction.
+    const invalidAudit = { ...validAudit, _id: savedAudit._id, requestId: `${TEST_RUN}-invalid` };
     await assert.rejects(saveBookingWithAdminAudit(changed, invalidAudit));
     const persisted = await Booking.findById(booking._id).lean();
     const invalidRecord = await AdminBookingAudit.findOne({ requestId: `${TEST_RUN}-invalid` }).lean();
-    assert.strictEqual(persisted.status, "pending", "booking write rolls back if audit insert fails");
+    assert.strictEqual(persisted.status, "confirmed", "booking write rolls back if audit insert fails");
     assert.strictEqual(invalidRecord, null, "failed audit insert leaves no audit record");
     console.log("bookingAuditTransaction.integration.test.js — transaction commit/rollback assertions passed");
+  } catch (error) {
+    error.message = `[${stage}] ${error.message}`;
+    throw error;
   } finally {
     await bookingCollection.deleteMany({ _id: booking._id });
     await auditCollection.deleteMany({ bookingId: booking._id });
@@ -78,6 +123,7 @@ async function verifyRealTransactionIfAvailable() {
 (async () => {
   try {
     await verifyUnsupportedFailsClosed();
+    await verifyTransientRetryReappliesChanges();
     await verifyRealTransactionIfAvailable();
   } catch (error) {
     if (error.name === "MongoServerSelectionError") {

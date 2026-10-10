@@ -5,6 +5,15 @@ const { requireCustomer, requireOwnedBooking } = require("../middlewares/custome
 const { requireBookingParticipant, requireOwnBookingList, requireActorRole, requireActorRoleAny } = require("../middlewares/bookingAuth");
 const { requireAdminBookingPermission } = require("../middlewares/adminBookingPermissions");
 const { getBookingAuditHistory } = require("../controller/bookingAuditController");
+const {
+    getAdminBookingModificationCatalog,
+    previewAdminBookingModification,
+    requestAdminBookingConsent,
+    getCustomerBookingConsent,
+    respondToBookingConsent,
+    getAdminBookingConsentStatus,
+    applyAdminBookingModification,
+} = require("../controller/adminBookingModificationController");
 const { getNotificationsByReceiverId } = require("../controller/notificationController");
 const { createS3Upload } = require("../utils/s3Upload");
 const { 
@@ -94,6 +103,13 @@ router.post('/addbooking/:id', requireAdmin, addbooking)
 // By Prashant 
 router.get('/getallbookings', requireAdmin, requireAdminBookingPermission("booking.view"), getallbookings)
 router.get('/:bookingId/audit', requireBookingParticipant(req => req.params.bookingId), requireAdminBookingPermission("booking.audit_read"), getBookingAuditHistory)
+router.get('/:bookingId/admin-modification/catalog', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.service_modify"), getAdminBookingModificationCatalog)
+router.post('/:bookingId/admin-modification/consent', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requestAdminBookingConsent)
+router.get('/:bookingId/admin-modification/consent/:consentId', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.view"), getAdminBookingConsentStatus)
+router.get('/:bookingId/admin-modification/consent', requireBookingParticipant(req => req.params.bookingId), requireActorRole("customer"), getCustomerBookingConsent)
+router.post('/:bookingId/admin-modification/consent/:consentId/respond', requireBookingParticipant(req => req.params.bookingId), requireActorRole("customer"), respondToBookingConsent)
+router.post('/:bookingId/admin-modification/preview', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), previewAdminBookingModification)
+router.post('/:bookingId/admin-modification', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), applyAdminBookingModification)
 
 
 router.get('/getuserbookings/:user_id', requireOwnBookingList, requireAdminBookingPermission("booking.view"), getuserbookings)
