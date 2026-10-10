@@ -1247,14 +1247,15 @@ async function dealerList(req, res) {
   }
 }
 
-// Fields the admin dealer list renders. Excludes OTP, session and document
-// payloads so a list page never ships credentials or KYC images.
+// Fields the admin dealer list renders. Excludes OTP, session and sensitive
+// credentials so a list page never ships passwords or auth tokens.
 const ADMIN_DEALER_LIST_FIELDS = [
   "id", "shopName", "ownerName", "phone", "email", "shopEmail", "personalEmail",
   "shopContact", "city", "state", "permanentAddress.city", "permanentAddress.state",
   "providesPickup", "providesDrop", "registrationStatus", "dealerStatus",
   "isActive", "isBlocked", "status", "submittedAt", "approvedAt",
-  "reVerification", "formProgress", "createdAt", "updatedAt", "online",
+  "reVerification", "formProgress", "documentVerification", "minWalletAmount",
+  "commission", "tax", "serviceRadiusKm", "services", "createdAt", "updatedAt", "online",
 ].join(" ");
 
 const ADMIN_DEALER_SORT_FIELDS = ["createdAt", "updatedAt", "submittedAt", "approvedAt", "shopName", "ownerName", "city"];
@@ -1342,9 +1343,8 @@ async function adminDealerList(req, res) {
     const data = dealers.map((dealer) => {
       const stats = statsById.get(String(dealer._id));
       const stageId = getDealerStage(dealer);
-      const { formProgress, ...rest } = dealer;
       return {
-        ...rest,
+        ...dealer,
         dealerId: dealer.id ? `MRBD${String(dealer.id).padStart(4, "0")}` : null,
         stage: stageId,
         stageLabel: STAGE_LABELS[stageId],
