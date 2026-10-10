@@ -165,6 +165,9 @@ async function seed() {
 
 async function run() {
   await seed();
+  // Mongoose can lazily issue createIndex on the first model operation. Keep
+  // that one-time setup outside the query-count window below.
+  await Vendor.init();
 
   const here = { lat: USER_LAT, lng: USER_LNG };
 
