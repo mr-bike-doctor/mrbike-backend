@@ -44,7 +44,7 @@ async function createBaseService(req, res) {
       })
     }
 
-    const { name, description, categoryId, basePrice, duration, pickupAvailable, warranty } = req.body
+    const { name, description, categoryId, basePrice, duration, pickupAvailable, warranty, isFeatured, isQuickService } = req.body
 
     /* =========================
        1. Validate name
@@ -103,6 +103,8 @@ async function createBaseService(req, res) {
       duration: duration !== undefined ? Number(duration) : 0,
       pickupAvailable: pickupAvailable === true || pickupAvailable === "true",
       warranty: warranty === true || warranty === "true",
+      isFeatured: isFeatured === true || isFeatured === "true",
+      isQuickService: isQuickService === true || isQuickService === "true",
     })
 
     return res.status(201).json({
@@ -198,7 +200,7 @@ async function getBaseServiceById(req, res) {
 async function updateBaseService(req, res) {
   try {
     const { id } = req.params
-    const { name, description, categoryId, basePrice, duration, pickupAvailable, warranty } = req.body
+    const { name, description, categoryId, basePrice, duration, pickupAvailable, warranty, isFeatured, isQuickService } = req.body
 
     if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -263,6 +265,13 @@ async function updateBaseService(req, res) {
 
     if (warranty !== undefined) {
       updateData.warranty = warranty === true || warranty === "true"
+    }
+
+    if (isFeatured !== undefined) {
+      updateData.isFeatured = isFeatured === true || isFeatured === "true"
+    }
+    if (isQuickService !== undefined) {
+      updateData.isQuickService = isQuickService === true || isQuickService === "true"
     }
 
     if (req.file) {

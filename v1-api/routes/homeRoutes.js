@@ -7,6 +7,7 @@ const { attachCustomerIfPresent } = require("../../middlewares/optionalCustomer"
 // Public — user app. Bike-aware when we can tell who is asking; see
 // serviceRoutes.js for why this is attached per route.
 router.get("/home/quick-services", attachCustomerIfPresent, controller.quickServices)
+router.get("/home/feed", attachCustomerIfPresent, controller.homeFeed)
 router.get("/home/recommended", attachCustomerIfPresent, controller.recommended)
 router.get("/home/most-booked", attachCustomerIfPresent, controller.mostBooked)
 router.get("/home/top-garages", attachCustomerIfPresent, controller.topGarages)

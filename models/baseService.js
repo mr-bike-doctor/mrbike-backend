@@ -80,6 +80,16 @@ const baseServiceSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Additive Home merchandising controls. These never override provider,
+    // bike, price, or location eligibility in the discovery resolver.
+    isFeatured: {
+      type: Boolean,
+      default: false,
+    },
+    isQuickService: {
+      type: Boolean,
+      default: false,
+    },
     isActive: {
       type: Boolean,
       default: true,

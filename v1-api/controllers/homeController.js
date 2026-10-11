@@ -1,5 +1,6 @@
 const mongoose = require("mongoose")
 const BaseService = require("../../models/baseService")
+const ServiceCategory = require("../../models/serviceCategoryModel")
 const {
   getRatingsMap,
   computeServicePopularity,
@@ -24,6 +25,7 @@ function formatImage(url, req) {
 // belt to that braces, guaranteeing nothing added to BaseService later can
 // silently inflate a home payload.
 const SERVICE_CARD_FIELDS = "name image description categoryId basePrice duration pickupAvailable warranty"
+const FEED_SERVICE_FIELDS = `${SERVICE_CARD_FIELDS} isFeatured isQuickService`
 
 function serializeService(service, req) {
   return {
@@ -36,6 +38,195 @@ function serializeService(service, req) {
     duration: service.duration,
     pickupAvailable: service.pickupAvailable,
     warranty: service.warranty,
+  }
+}
+
+function feedSection(key, title, itemType, items, limit) {
+  const boundedItems = items.slice(0, limit)
+  return { key, title, itemType, visible: boundedItems.length > 0, items: boundedItems }
+}
+
+function sortByPopularityThenDistance(a, b) {
+  return b.popularityCount - a.popularityCount ||
+    (a.nearestDealerDistanceKm ?? Number.MAX_SAFE_INTEGER) - (b.nearestDealerDistanceKm ?? Number.MAX_SAFE_INTEGER) ||
+    a.name.localeCompare(b.name) || String(a.serviceId).localeCompare(String(b.serviceId))
+}
+
+// Additive composed feed. Eligibility is resolved once, then every service
+// section is selected from that same eligible id set. Individual legacy feeds
+// below remain untouched for older app versions.
+async function homeFeed(req, res) {
+  try {
+    const context = await resolveDiscoveryContext(req, res)
+    if (context === null) return
+    const { bikeContexts, primaryBikeId, scope, eligibility } = context
+
+    const pricedEligibleServiceIds = eligibility.serviceIds.filter(id =>
+      eligibility.byServiceId.get(String(id))?.minPrice != null,
+    )
+    if (!pricedEligibleServiceIds.length) {
+      return res.status(200).json({
+        status: true,
+        message: "Home feed fetched",
+        data: {
+          sections: [
+            feedSection("categories", "Browse by Category", "categories", [], 12),
+            feedSection("featured", "Featured Services", "services", [], 8),
+            feedSection("quickServices", "Quick Services", "services", [], 8),
+            feedSection("mostBooked", "Most Booked", "services", [], 6),
+            feedSection("recommended", "Recommended For Your Bike", "services", [], 10),
+            feedSection("explore", "Explore Services", "services", [], 12),
+            feedSection("topGarages", "Top Rated Garages", "garages", [], 5),
+          ],
+          emptyState: { key: "coverage", message: "Services are not available in this area yet", action: "changeLocation" },
+        },
+        meta: scopeMeta(scope, bikeContexts, context.primaryBikeId),
+      })
+    }
+
+    const [services, categories, popularity] = await Promise.all([
+      BaseService.find({ _id: { $in: pricedEligibleServiceIds }, isActive: true })
+        .select(FEED_SERVICE_FIELDS)
+        .sort({ name: 1, _id: 1 })
+        .lean(),
+      ServiceCategory.find({ isActive: true }).sort({ sortOrder: 1, name: 1, _id: 1 }).lean(),
+      computeServicePopularity(popularityScopeIds(scope)),
+    ])
+
+    const categoryById = new Map(categories.map(category => [String(category._id), category]))
+    const rankedServices = services.map(service => {
+      const id = String(service._id)
+      const bucket = eligibility.byServiceId.get(id)
+      const pop = popularity.get(id) || { count: 0, source: "dealerCount" }
+      const distance = bucket?.minDistanceKm
+      const serialized = {
+        ...serializeService(service, req),
+        category: service.categoryId ? (() => {
+          const category = categoryById.get(String(service.categoryId))
+          return category ? { id: category._id, name: category.name, icon: category.icon } : null
+        })() : null,
+        basePrice: bucket?.minPrice ?? service.basePrice,
+        providerCount: bucket?.dealerIds.size || 0,
+        eligibleBikeIds: Array.from(bucket?.eligibleBikeIds || []),
+        compatibleBikeIds: Array.from(bucket?.eligibleBikeIds || []),
+        compatibleBikeCount: bucket?.eligibleBikeIds?.size || 0,
+        isPrimaryBikeCompatible: !!primaryBikeId && bucket?.eligibleBikeIds?.has(primaryBikeId),
+        popularityCount: pop.count,
+        popularitySource: pop.source,
+        nearestDealerDistanceKm: distance != null ? Number(distance.toFixed(2)) : null,
+      }
+      return {
+        ...serialized,
+        _isFeatured: !!service.isFeatured,
+        _isQuickService: !!service.isQuickService,
+      }
+    })
+
+    const comparePrimaryFirst = (a, b) => Number(b.isPrimaryBikeCompatible) - Number(a.isPrimaryBikeCompatible) || sortByPopularityThenDistance(a, b)
+    const used = new Set()
+    const take = (rows, limit) => {
+      const selected = []
+      rows.forEach(item => {
+        const id = String(item.serviceId)
+        if (used.has(id) || selected.length >= limit) return
+        used.add(id)
+        const { _isFeatured, _isQuickService, ...publicItem } = item
+        selected.push(publicItem)
+      })
+      return selected
+    }
+    const featured = take(rankedServices.filter(item => item._isFeatured).sort(comparePrimaryFirst), 8)
+    const quick = take(rankedServices.filter(item => item._isQuickService).sort(comparePrimaryFirst), 8)
+    const mostBooked = take(rankedServices
+      .filter(item => item.popularitySource === "bookings" && item.popularityCount > 0)
+      .sort(sortByPopularityThenDistance), 6)
+      .map(item => ({ ...item, bookingCount: item.popularityCount, isFallback: false }))
+
+    const maxCount = Math.max(1, ...rankedServices.map(item => item.popularityCount))
+    const distanceValues = rankedServices.map(item => item.nearestDealerDistanceKm).filter(value => value != null)
+    const proximityScale = Math.max(DEFAULT_RADIUS_KM, ...distanceValues)
+    const recommendedCandidates = rankedServices
+      .filter(item => !used.has(String(item.serviceId)))
+      .map(item => {
+        const popularityScore = item.popularityCount / maxCount
+        const distance = item.nearestDealerDistanceKm
+        const proximityScore = distance != null ? Math.max(0, 1 - distance / proximityScale) : 0
+        const score = bikeContexts.length
+          ? 0.5 * popularityScore + 0.3 * proximityScore + 0.2
+          : 0.6 * popularityScore + 0.4 * proximityScore
+        let reasonCode = "popular"
+        let reasonLabel = "Popular near you"
+        if (bikeContexts.length && popularityScore < 0.5 && proximityScore < 0.5) {
+          reasonCode = "compatible_with_bike"
+          reasonLabel = "Great match for your bike"
+        } else if (proximityScore > popularityScore) {
+          reasonCode = "nearby"
+          reasonLabel = "Available nearby"
+        }
+        return { ...item, score: Number(score.toFixed(3)), reasonCode, reasonLabel }
+      })
+      .sort((a, b) => Number(b.isPrimaryBikeCompatible) - Number(a.isPrimaryBikeCompatible) || b.score - a.score || sortByPopularityThenDistance(a, b))
+    const recommended = take(recommendedCandidates, 10)
+    const explore = take(rankedServices.slice().sort(comparePrimaryFirst), 12)
+
+    const representedCategories = new Set(rankedServices
+      .map(item => item.category?.id && String(item.category.id))
+      .filter(Boolean))
+    const visibleCategories = categories
+      .filter(category => representedCategories.has(String(category._id)))
+      .slice(0, 12)
+      .map(category => ({ _id: category._id, id: category.id, name: category.name, icon: category.icon }))
+
+    const eligibleDealerIds = new Set()
+    services.forEach(service => {
+      const bucket = eligibility.byServiceId.get(String(service._id))
+      bucket?.dealerIds.forEach(id => eligibleDealerIds.add(id))
+    })
+    const dealers = Array.from(eligibleDealerIds).map(id => scope.dealerById.get(id)).filter(Boolean)
+    const ratingsMap = await getRatingsMap(dealers.map(dealer => dealer._id))
+    const garages = dealers.map(dealer => {
+      const rating = ratingsMap.get(String(dealer._id)) || { averageRating: 0, ratingCount: 0 }
+      const distanceKm = scope.distanceByDealerId.get(String(dealer._id))
+      return {
+        dealerId: dealer._id,
+        shopName: dealer.shopName,
+        city: dealer.city,
+        locality: dealer.locality,
+        latitude: dealer.latitude,
+        longitude: dealer.longitude,
+        distanceKm: distanceKm != null ? Number(distanceKm.toFixed(2)) : null,
+        averageRating: rating.averageRating,
+        ratingCount: rating.ratingCount,
+        shopImages: (dealer.shopImages || []).map(url => formatImage(url, req)),
+      }
+    }).sort((a, b) => b.averageRating - a.averageRating ||
+      (a.distanceKm ?? Number.MAX_SAFE_INTEGER) - (b.distanceKm ?? Number.MAX_SAFE_INTEGER) ||
+      a.shopName.localeCompare(b.shopName) || String(a.dealerId).localeCompare(String(b.dealerId)))
+      .slice(0, 5)
+
+    const sections = [
+      feedSection("categories", "Browse by Category", "categories", visibleCategories, 12),
+      feedSection("featured", "Featured Services", "services", featured, 8),
+      feedSection("quickServices", "Quick Services", "services", quick, 8),
+      feedSection("mostBooked", "Most Booked", "services", mostBooked, 6),
+      feedSection("recommended", "Recommended For Your Bike", "services", recommended, 10),
+      feedSection("explore", "Explore Services", "services", explore, 12),
+      feedSection("topGarages", "Top Rated Garages", "garages", garages, 5),
+    ]
+    return res.status(200).json({
+      status: true,
+      message: "Home feed fetched",
+      data: {
+        sections,
+        emptyState: rankedServices.length
+          ? null
+          : { key: "coverage", message: "Services are not available in this area yet", action: "changeLocation" },
+      },
+      meta: scopeMeta(scope, bikeContexts, primaryBikeId),
+    })
+  } catch (error) {
+    console.error("Error fetching composed Home feed:", error)
+    return res.status(500).json({ status: false, message: "Internal Server Error" })
   }
 }
 
@@ -56,7 +247,7 @@ async function resolveDiscoveryContext(req, res) {
     return null
   }
 
-  const { contexts: bikeContexts } = await resolveDiscoveryBikeContexts({
+    const { contexts: bikeContexts, primaryBikeId } = await resolveDiscoveryBikeContexts({
     userId: req.user_id || null,
     bikeId,
     bikeIds,
@@ -72,7 +263,7 @@ async function resolveDiscoveryContext(req, res) {
 
   const eligibility = await resolveEligibleServices({ scope, bikeContexts })
 
-  return { bikeContexts, scope, eligibility }
+  return { bikeContexts, primaryBikeId: primaryBikeId || null, scope, eligibility }
 }
 
 // Popularity is a ranking signal, not an eligibility gate — eligibility is
@@ -85,13 +276,14 @@ function popularityScopeIds(scope) {
 
 // `meta.scope` keeps its original two values so existing clients keep working;
 // `meta.scopeKind` carries the finer area/city/network distinction.
-function scopeMeta(scope, bikeContexts) {
+function scopeMeta(scope, bikeContexts, primaryBikeId = null) {
   return {
     scope: scope.kind === "network" ? "network" : "area",
     scopeKind: scope.kind,
     bikeMatched: bikeContexts.length > 0,
     bikeCount: bikeContexts.length,
     evaluatedBikeIds: bikeContexts.map(ctx => ctx.bikeId),
+    primaryBikeId: primaryBikeId || null,
   }
 }
 
@@ -380,4 +572,4 @@ async function topGarages(req, res) {
   }
 }
 
-module.exports = { quickServices, recommended, mostBooked, topGarages }
+module.exports = { homeFeed, quickServices, recommended, mostBooked, topGarages }

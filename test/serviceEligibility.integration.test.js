@@ -16,11 +16,14 @@ const BikeVariant = require("../models/bikeVariantModel");
 const BikeModel = require("../models/bikeModel");
 const BikeCompany = require("../models/bikeCompanyModel");
 const Vendor = require("../models/dealerModel");
+const Booking = require("../models/Booking");
+const ServiceCategory = require("../models/serviceCategoryModel");
 // Registered for its side effect: listByCategory populates categoryId.
 require("../models/serviceCategoryModel");
 
 const homeController = require("../v1-api/controllers/homeController");
 const serviceController = require("../v1-api/controllers/serviceController");
+const baseServiceController = require("../controller/baseService");
 
 const oid = hex => new mongoose.Types.ObjectId(hex);
 const id = n => oid(String(n).padStart(24, "0"));
@@ -33,6 +36,7 @@ const USER = id(41);
 const BIKE_A = id(51), BIKE_B = id(52), BIKE_C = id(53);
 const D1 = id(61), D2 = id(62), D3 = id(63), D_OFFLINE = id(64), D_FAR = id(65);
 const SVC = [null, id(71), id(72), id(73), id(74), id(75), id(76)];
+const CATEGORY_BOOKABLE = id(81), CATEGORY_EMPTY_LOCAL = id(82);
 
 // User sits at (23.2599, 77.4126). D1/D2/D3/D_OFFLINE are ~1 km away; D_FAR is
 // ~50 km away, well outside any configured radius.
@@ -133,6 +137,10 @@ async function seed() {
       // Bookable but ~50 km away, outside its own 5 km radius.
       bookableDealer(D_FAR, { latitude: USER_LAT + 0.45, longitude: USER_LNG }),
     ]),
+    ServiceCategory.collection.insertMany([
+      { _id: CATEGORY_BOOKABLE, id: 1, name: "Maintenance", icon: "wrench", isActive: true, sortOrder: 0 },
+      { _id: CATEGORY_EMPTY_LOCAL, id: 2, name: "Unavailable", icon: "tools", isActive: true, sortOrder: 1 },
+    ]),
     BaseService.collection.insertMany(
       [1, 2, 3, 4, 5, 6].map(n => ({
         _id: SVC[n],
@@ -145,6 +153,9 @@ async function seed() {
         pickupAvailable: false,
         warranty: false,
         isActive: true,
+        ...(n === 1 ? { categoryId: CATEGORY_BOOKABLE, isFeatured: true } : {}),
+        ...(n === 2 ? { isQuickService: true } : {}),
+        ...(n === 6 ? { categoryId: CATEGORY_EMPTY_LOCAL } : {}),
       })),
     ),
   ]);
@@ -160,6 +171,9 @@ async function seed() {
     // never appear, even though its BaseService row is perfectly active.
     { serviceId: "T-006", base_service_id: SVC[6], dealer_id: D_OFFLINE, companies: [HONDA], bikes: [{ model_id: M1, variant_id: V1, cc: 110, price: 200 }], isActive: true },
     { serviceId: "T-007", base_service_id: SVC[6], dealer_id: D_FAR, companies: [HONDA], bikes: [{ model_id: M1, variant_id: V1, cc: 110, price: 200 }], isActive: true },
+    // Corrupt legacy row without a usable price: it must never enter the new
+    // feed, including no-bike discovery.
+    { serviceId: "T-008", base_service_id: SVC[1], dealer_id: D1, companies: [HONDA], bikes: [{ model_id: M1, variant_id: V1, cc: 110 }], isActive: false },
   ]);
 }
 
@@ -208,6 +222,59 @@ async function run() {
   assert.strictEqual(quick.meta.bikeCount, 3);
   // Card price is the cheapest across the bikes that service can be booked for.
   assert.strictEqual(quick.data.find(s => s.name === "Service 2").basePrice, 600);
+
+  // Composed feed resolves categories and service eligibility from the same
+  // nearby, priced service set. Admin-selected rows take precedence and each
+  // service appears in at most one section.
+  const feed = await call(homeController.homeFeed, req(here, { user_id: String(USER) }));
+  const section = key => feed.data.sections.find(item => item.key === key);
+  assert.deepStrictEqual(section("categories").items.map(item => item.name), ["Maintenance"]);
+  assert.deepStrictEqual(section("featured").items.map(item => item.name), ["Service 1"]);
+  assert.deepStrictEqual(section("quickServices").items.map(item => item.name), ["Service 2"]);
+  assert.deepStrictEqual(section("mostBooked").items, [], "dealer coverage must not be reported as bookings");
+  assert.deepStrictEqual(section("recommended").items.map(item => item.name).sort(), ["Service 3", "Service 4", "Service 5"]);
+  const visibleServiceIds = feed.data.sections.flatMap(item => item.itemType === "services" ? item.items.map(service => String(service.serviceId)) : []);
+  assert.strictEqual(new Set(visibleServiceIds).size, visibleServiceIds.length, "service cards must be deduplicated across sections");
+  assert.strictEqual(feed.data.emptyState, null);
+
+  const noBikeFeed = await call(homeController.homeFeed, req(here));
+  assert.strictEqual(noBikeFeed.meta.bikeMatched, false);
+  const noBikeServiceItems = noBikeFeed.data.sections.flatMap(item => item.itemType === "services" ? item.items : []);
+  assert.strictEqual(noBikeServiceItems.length, 5);
+  const noProviderFeed = await call(homeController.homeFeed, req({ lat: USER_LAT + 0.9, lng: USER_LNG }, { user_id: String(USER) }));
+  assert.deepStrictEqual(noProviderFeed.data.sections.filter(item => item.visible), []);
+  assert.strictEqual(noProviderFeed.data.emptyState.action, "changeLocation");
+
+  // Real booking data enters Most Booked; the selected service remains unique.
+  const service3AdminRow = await AdminService.findOne({ base_service_id: SVC[3] }).select("_id").lean();
+  await Booking.collection.insertOne({
+    _id: id(901), dealer_id: D2, services: [service3AdminRow._id],
+    userBike_id: BIKE_B, status: "completed", create_date: new Date(),
+  });
+  const withRealPopularity = await call(homeController.homeFeed, req(here, { user_id: String(USER) }));
+  assert.deepStrictEqual(withRealPopularity.data.sections.find(item => item.key === "mostBooked").items.map(item => item.name), ["Service 3"]);
+
+  const adminUpdateResponse = res();
+  await baseServiceController.updateBaseService({
+    params: { id: String(SVC[1]) },
+    body: { name: "Service 1", isFeatured: "false" },
+    protocol: "http", get: () => "localhost",
+  }, adminUpdateResponse);
+  assert.strictEqual(adminUpdateResponse.captured.code, 200);
+  const updatedFlags = await BaseService.findById(SVC[1]).select("isFeatured isQuickService").lean();
+  assert.strictEqual(updatedFlags.isFeatured, false);
+  assert.strictEqual(updatedFlags.isQuickService, undefined, "omitted Home flags must retain their existing value");
+  const quickFlagResponse = res();
+  await baseServiceController.updateBaseService({
+    params: { id: String(SVC[2]) },
+    body: { name: "Service 2", isFeatured: "true" },
+    protocol: "http", get: () => "localhost",
+  }, quickFlagResponse);
+  const retainedQuickFlag = await BaseService.findById(SVC[2]).select("isFeatured isQuickService").lean();
+  assert.strictEqual(retainedQuickFlag.isFeatured, true);
+  assert.strictEqual(retainedQuickFlag.isQuickService, true, "editing Featured must retain Quick selection");
+  await BaseService.findByIdAndUpdate(SVC[1], { isFeatured: true });
+  await BaseService.findByIdAndUpdate(SVC[2], { isFeatured: false });
 
   const rec = await call(homeController.recommended, req(here, { user_id: String(USER) }));
   assert.deepStrictEqual(names(rec), ["Service 1", "Service 2", "Service 3", "Service 4", "Service 5"]);
@@ -292,6 +359,7 @@ async function run() {
     quick: await measure(homeController.quickServices),
     recommended: await measure(homeController.recommended),
     topGarages: await measure(homeController.topGarages),
+    feed: await measure(homeController.homeFeed),
   };
 
   // Nothing may issue one query per service or per dealer.
@@ -336,6 +404,7 @@ async function run() {
     quick: await measure(homeController.quickServices),
     recommended: await measure(homeController.recommended),
     topGarages: await measure(homeController.topGarages),
+    feed: await measure(homeController.homeFeed),
   };
 
   Object.keys(before).forEach(name => {
@@ -354,6 +423,8 @@ async function run() {
   assert.deepStrictEqual((await call(homeController.recommended, req(here, { user_id: String(USER) }))).data, []);
   assert.deepStrictEqual((await call(homeController.mostBooked, req(here, { user_id: String(USER) }))).data, []);
   assert.deepStrictEqual((await call(homeController.topGarages, req(here, { user_id: String(USER) }))).data, []);
+  const noCoverage = await call(homeController.homeFeed, req(here, { user_id: String(USER) }));
+  assert.ok(noCoverage.data.emptyState);
 }
 
 (async () => {
