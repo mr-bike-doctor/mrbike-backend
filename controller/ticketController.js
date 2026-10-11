@@ -4,6 +4,8 @@ const Admin = require("../models/admin_model")
 const Customer = require("../models/customer_model")
 const Vendor = require("../models/dealerModel")
 const Booking = require("../models/Booking")
+const AdminBookingAudit = require("../models/AdminBookingAudit")
+const { createAdminBookingAuditEvent, correlationId } = require("../services/bookingAudit")
 
 const BOOKING_ISSUES = {
   CANCEL_BOOKING: { label: "Cancel my booking", priority: "urgent" },
@@ -99,6 +101,30 @@ const attachRaisedBy = async (tickets) => {
 // Ticket.user_type/sender_type use "user"/"dealer" (see models/ticket_model.js
 // ROLES) — map between the two instead of hardcoding "user" for everyone.
 const ROLE_TO_TICKET_TYPE = { customer: "user", dealer: "dealer" }
+
+async function saveTicketWithBookingAudit(ticket, req, action, before, after, reason = "Support case updated") {
+  if (!ticket.booking_id) return ticket.save()
+  const session = await mongoose.startSession()
+  try {
+    await session.withTransaction(async () => {
+      await ticket.save({ session })
+      const audit = createAdminBookingAuditEvent({
+        bookingId: ticket.booking_id,
+        adminId: req.admin_id || req.auth.id,
+        adminRole: req.admin_role || req.auth.adminRole || "Admin",
+        action,
+        reason,
+        before,
+        after,
+        requestId: correlationId(req),
+      })
+      await AdminBookingAudit.create([audit], { session })
+    })
+  } finally {
+    await session.endSession()
+  }
+  return ticket
+}
 
 const createTicket = async (req, res) => {
   try {
@@ -231,8 +257,13 @@ const replyToTicket = async (req, res) => {
   try {
     const { ticket_id } = req.params
     const { message } = req.body
+    const internal = req.body?.internal === true
     const sender_id = req.auth.id
     const sender_type = req.auth.role === "customer" ? "user" : req.auth.role
+
+    if (internal && req.auth.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Internal notes are available to support admins only." })
+    }
 
     if (!ticket_id || !message || !sender_id || !sender_type) {
       return res
@@ -245,37 +276,52 @@ const replyToTicket = async (req, res) => {
     if (ticket.status === "Closed") return res.status(400).json({ success: false, message: "Ticket is closed" })
 
     // push message
-    ticket.messages.push({
+    const before = { status: ticket.status, lastMessageAt: ticket.lastMessageAt }
+    ticket.addMessage({
       sender_id,
-      sender_type, // "admin" | "dealer" | "user"  (or numbers if that's what you store)
+      sender_type,
       message,
+      internal,
       timestamp: new Date(),
     })
-    // optional: update convenience fields
-    ticket.lastMessageAt = new Date()
-    ticket.lastMessageText = message
 
     // Admin's own reply implies they've seen the thread; a dealer/user reply
     // bumps every active admin's unread counter for this ticket.
     let notifyAdminIds = []
-    if (sender_type === "admin") {
+    if (internal) {
+      // Private notes only increment the admin author's read state; the model
+      // deliberately excludes them from customer/provider unread counters.
+      ticket.resetUnreadForAdmin(sender_id)
+    } else if (sender_type === "admin") {
       ticket.resetUnreadForAdmin(sender_id)
     } else {
       notifyAdminIds = await getActiveAdminIds()
       ticket.incrementUnreadForAdmins(notifyAdminIds)
     }
 
-    await ticket.save()
+    if (req.auth.role === "admin") {
+      await saveTicketWithBookingAudit(ticket, req, internal ? "booking.support_internal_note_added" : "booking.support_reply_added", before, { status: ticket.status }, internal ? "Internal support note added" : "Support reply added")
+    } else {
+      await ticket.save()
+    }
 
     // repop / lean if you want to send a clean object
     const updated = await Ticket.findById(ticket_id).lean({ virtuals: true })
+    const publicMessages = (updated.messages || []).filter((entry) => !entry.internal)
+    const lastPublicMessage = publicMessages[publicMessages.length - 1]
+    const participantView = {
+      ...updated,
+      messages: publicMessages,
+      lastMessageAt: lastPublicMessage?.timestamp || null,
+      lastMessageText: lastPublicMessage?.message || lastPublicMessage?.attachments?.[0]?.name || (lastPublicMessage ? "[attachment]" : ""),
+    }
 
     // 🔊 emit to everyone viewing this ticket
     const io = req.app.get("io")
-    if (io) {
+    if (io && !internal) {
       io.to(String(ticket_id)).emit("ticket:message:new", {
         ticketId: String(ticket_id),
-        ticket: updated, // or just send the new message to minimize payload
+        ticket: participantView,
         // message: updated.messages[updated.messages.length - 1],
       })
 
@@ -288,7 +334,8 @@ const replyToTicket = async (req, res) => {
       }
     }
 
-    return res.status(200).json({ success: true, message: "Reply added", data: updated })
+    if (internal && io) io.to(`admin:${sender_id}`).emit("support:internal-note:added", { ticketId: String(ticket_id) })
+    return res.status(200).json({ success: true, message: internal ? "Internal note added" : "Reply added", data: req.auth.role === "admin" ? updated : participantView })
   } catch (err) {
     console.error("Ticket Reply Error:", err)
     return res.status(500).json({ success: false, message: "Internal server error" })
@@ -310,6 +357,17 @@ const getMyTickets = async (req, res) => {
     const tickets = await Ticket.find({ user_id: new mongoose.Types.ObjectId(user_id) })
       .sort({ created_at: -1 })
       .lean()
+
+    // This endpoint serves customer/dealer views. Internal support notes and
+    // their derived preview text are never included in participant responses.
+    if (req.auth?.role !== "admin") {
+      tickets.forEach((ticket) => {
+        ticket.messages = (ticket.messages || []).filter((message) => !message.internal)
+        const lastPublic = ticket.messages[ticket.messages.length - 1]
+        ticket.lastMessageAt = lastPublic?.timestamp || null
+        ticket.lastMessageText = lastPublic?.message || lastPublic?.attachments?.[0]?.name || (lastPublic ? "[attachment]" : "")
+      })
+    }
 
     return res.status(200).json({
       success: true,
@@ -452,8 +510,8 @@ const getTicketById = async (req, res) => {
 
     // identify viewer (assumes you set req.user in auth middleware)
     // expected shape: { _id: ObjectId, role: "admin" | "dealer" | "user" }
-    const viewer = req.user || {}
-    const viewerId = viewer._id ? String(viewer._id) : null
+    const viewer = req.auth || {}
+    const viewerId = viewer.id ? String(viewer.id) : null
     const isAdmin = viewer.role === "admin"
 
     // Fetch ticket
@@ -469,6 +527,12 @@ const getTicketById = async (req, res) => {
         unreadFor: 1,
         created_at: 1,
         ticketNo: 1,
+        booking_id: 1,
+        source: 1,
+        issue_type: 1,
+        issue_label: 1,
+        priority: 1,
+        assignee_id: 1,
       })
       .populate({
         path: "messages.sender_id",
@@ -486,8 +550,11 @@ const getTicketById = async (req, res) => {
     }
 
     // Hide internal messages for non-admins
-    if (!isAdmin && includeMessages && Array.isArray(ticket.messages)) {
-      ticket.messages = ticket.messages.filter((m) => !m.internal)
+    if (!isAdmin) {
+      ticket.messages = includeMessages && Array.isArray(ticket.messages) ? ticket.messages.filter((m) => !m.internal) : []
+      const lastPublic = ticket.messages[ticket.messages.length - 1]
+      ticket.lastMessageAt = lastPublic?.timestamp || null
+      ticket.lastMessageText = lastPublic?.message || lastPublic?.attachments?.[0]?.name || (lastPublic ? "[attachment]" : "")
     }
 
     // Optionally mark seen for viewer (non-admin/admin both allowed)
@@ -578,7 +645,7 @@ const updateTicketStatus = async (req, res) => {
     const { ticket_id } = req.params
     const { status } = req.body
 
-    const allowed = ["Open", "In Progress", "Closed"]
+    const allowed = ["Open", "In Progress", "Resolved", "Closed"]
     if (!status || !allowed.includes(status)) {
       return res.status(400).json({
         success: false,
@@ -602,7 +669,7 @@ const updateTicketStatus = async (req, res) => {
     }
 
     // Fetch existing (lean for speed)
-    const existing = await Ticket.findOne(filter).select({ status: 1, ticketNo: 1 }).lean()
+    const existing = await Ticket.findOne(filter).select({ status: 1, ticketNo: 1, booking_id: 1 }).lean()
 
     if (!existing) {
       return res.status(404).json({ success: false, message: "Ticket not found" })
@@ -625,11 +692,16 @@ const updateTicketStatus = async (req, res) => {
     }
 
     // Apply update
-    const updated = await Ticket.findOneAndUpdate(
-      filter,
-      { $set: { status } },
-      { new: true }, // return the updated doc
-    ).lean()
+    const ticketDoc = await Ticket.findOne(filter)
+    if (!ticketDoc) return res.status(404).json({ success: false, message: "Ticket not found" })
+    const previousStatus = ticketDoc.status
+    ticketDoc.setStatus(status)
+    if (req.auth?.role === "admin") {
+      await saveTicketWithBookingAudit(ticketDoc, req, "booking.support_status_changed", { status: previousStatus }, { status }, `Support case status changed to ${status}`)
+    } else {
+      await ticketDoc.save()
+    }
+    const updated = ticketDoc.toObject({ virtuals: true })
 
     const date = new Date(updated.created_at)
     const day = String(date.getDate()).padStart(2, "0")
@@ -653,6 +725,94 @@ const updateTicketStatus = async (req, res) => {
   } catch (err) {
     console.error("Update Ticket Status Error:", err)
     return res.status(500).json({ success: false, message: "Internal server error" })
+  }
+}
+
+const createAdminBookingTicket = async (req, res) => {
+  const { bookingId } = req.params
+  const subject = String(req.body?.subject || "").trim().slice(0, 255)
+  const message = String(req.body?.message || "").trim().slice(0, 10000)
+  if (!subject || !message) return res.status(400).json({ success: false, message: "Subject and case details are required." })
+  if (!mongoose.Types.ObjectId.isValid(bookingId)) return res.status(400).json({ success: false, message: "Invalid booking ID" })
+  let booking
+  try {
+    booking = await Booking.findById(bookingId).select("_id user_id status id").lean()
+  } catch (error) {
+    console.error("Admin support case booking lookup failed:", error.message)
+    return res.status(500).json({ success: false, message: "Could not load booking context." })
+  }
+  if (!booking) return res.status(404).json({ success: false, message: "Booking not found" })
+  const adminId = req.admin_id || req.auth?.id
+  const adminRole = req.admin_role || req.auth?.adminRole
+  if (!adminId || !adminRole) return res.status(403).json({ success: false, message: "Active admin identity is required." })
+  let session
+  try {
+    session = await mongoose.startSession()
+  } catch (error) {
+    console.error("Admin support case transaction unavailable:", error.message)
+    return res.status(503).json({ success: false, message: "Support case was not created because transaction support is unavailable." })
+  }
+  let created
+  try {
+    await session.withTransaction(async () => {
+      const docs = await Ticket.create([{
+        user_id: booking.user_id,
+        user_type: "user",
+        subject,
+        booking_id: booking._id,
+        source: "booking_support",
+        issue_type: String(req.body?.issueType || "OTHER_BOOKING_ISSUE").slice(0, 80),
+        issue_label: String(req.body?.issueLabel || "Admin support case").slice(0, 160),
+        priority: ["normal", "high", "urgent"].includes(req.body?.priority) ? req.body.priority : "normal",
+        booking_status_at_creation: booking.status || "",
+        messages: [{ sender_id: adminId, sender_type: "admin", message, internal: true }],
+      }], { session })
+      created = docs[0]
+      const audit = createAdminBookingAuditEvent({ bookingId: booking._id, adminId, adminRole, action: "booking.support_case_created", reason: "Support case created", before: {}, after: { ticketId: created._id, status: created.status }, requestId: correlationId(req) })
+      await AdminBookingAudit.create([audit], { session })
+    })
+  } catch (error) {
+    console.error("Admin support case creation failed:", error.message)
+    return res.status(503).json({ success: false, message: "Support case was not created because its audit record could not be committed." })
+  } finally {
+    await session.endSession()
+  }
+  return res.status(201).json({ success: true, message: "Support case created", data: created.toObject({ virtuals: true }) })
+}
+
+const assignBookingTicket = async (req, res) => {
+  const { ticket_id } = req.params
+  const assigneeId = req.body?.assigneeId
+  if (!mongoose.Types.ObjectId.isValid(assigneeId)) return res.status(400).json({ success: false, message: "A valid support assignee is required." })
+  let assignee
+  let ticket
+  try {
+    assignee = await Admin.findOne({ _id: assigneeId, status: "active", role: { $in: ["Admin", "Subadmin", "Manager", "Executive", "Telecaller"] } }).select("_id role").lean()
+    ticket = await Ticket.findOne({ _id: ticket_id, source: "booking_support" })
+  } catch (error) {
+    console.error("Support case assignment lookup failed:", error.message)
+    return res.status(500).json({ success: false, message: "Could not load support case assignment context." })
+  }
+  if (!assignee) return res.status(400).json({ success: false, message: "Assignee must be an active support admin." })
+  if (!ticket) return res.status(404).json({ success: false, message: "Booking support case not found" })
+  if (!ticket.booking_id) return res.status(409).json({ success: false, message: "This support case is missing its booking link and cannot be reassigned here." })
+  const previous = ticket.assignee_id
+  ticket.assignee_id = assignee._id
+  try {
+    await saveTicketWithBookingAudit(ticket, req, "booking.support_case_assigned", { assigneeId: previous || null }, { assigneeId: assignee._id }, "Support case assigned")
+  } catch (error) {
+    console.error("Support case assignment failed:", error.message)
+    return res.status(503).json({ success: false, message: "Assignment was not saved because its audit record could not be committed." })
+  }
+  return res.json({ success: true, data: { ticketId: ticket._id, assigneeId: assignee._id, assigneeRole: assignee.role } })
+}
+
+const getBookingSupportAssignees = async (req, res) => {
+  try {
+    const rows = await Admin.find({ status: "active", role: { $in: ["Admin", "Subadmin", "Manager", "Executive", "Telecaller"] } }).select("_id name role ID").sort({ name: 1 }).lean()
+    return res.json({ success: true, data: rows })
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Could not load active support staff" })
   }
 }
 
@@ -706,4 +866,7 @@ module.exports = {
   getTicketById,
   getSupportUnreadCount,
   markTicketRead,
+  createAdminBookingTicket,
+  assignBookingTicket,
+  getBookingSupportAssignees,
 }

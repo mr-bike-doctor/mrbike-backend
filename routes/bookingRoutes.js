@@ -4,9 +4,18 @@ const { requireAdmin } = require("../middlewares/requireAdmin");
 const { requireCustomer, requireOwnedBooking } = require("../middlewares/customerAuth");
 const { requireBookingParticipant, requireOwnBookingList, requireActorRole, requireActorRoleAny } = require("../middlewares/bookingAuth");
 const { requireAdminBookingPermission } = require("../middlewares/adminBookingPermissions");
+const {
+    getBookingControlCenter,
+    getBookingFinancialOverview,
+    getBookingTracking,
+    findEligibleProviders,
+    reassignProvider,
+    cancelBookingForSupport,
+} = require("../controller/adminBookingControlController");
 const { getBookingAuditHistory } = require("../controller/bookingAuditController");
 const {
     getAdminBookingModificationCatalog,
+    getAdminBookingScheduleSlots,
     previewAdminBookingModification,
     requestAdminBookingConsent,
     getCustomerBookingConsent,
@@ -102,8 +111,17 @@ router.post('/addbooking/:id', requireAdmin, addbooking)
 
 // By Prashant 
 router.get('/getallbookings', requireAdmin, requireAdminBookingPermission("booking.view"), getallbookings)
-router.get('/:bookingId/audit', requireBookingParticipant(req => req.params.bookingId), requireAdminBookingPermission("booking.audit_read"), getBookingAuditHistory)
+router.get('/:bookingId/audit', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.audit_read"), getBookingAuditHistory)
+// Support control-center read model and guarded operational actions. These
+// actions are kept separate from customer/dealer lifecycle endpoints.
+router.get('/:bookingId/control-center', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.view"), getBookingControlCenter)
+router.get('/:bookingId/control-center/financial', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.charge_review"), getBookingFinancialOverview)
+router.get('/:bookingId/control-center/tracking', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.live_gps"), getBookingTracking)
+router.get('/:bookingId/provider-candidates', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.reassign"), findEligibleProviders)
+router.post('/:bookingId/reassign-provider', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.reassign"), reassignProvider)
+router.post('/:bookingId/support-cancel', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.cancel"), cancelBookingForSupport)
 router.get('/:bookingId/admin-modification/catalog', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.service_modify"), getAdminBookingModificationCatalog)
+router.get('/:bookingId/admin-modification/slots', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.service_modify"), getAdminBookingScheduleSlots)
 router.post('/:bookingId/admin-modification/consent', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requestAdminBookingConsent)
 router.get('/:bookingId/admin-modification/consent/:consentId', requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.view"), getAdminBookingConsentStatus)
 router.get('/:bookingId/admin-modification/consent', requireBookingParticipant(req => req.params.bookingId), requireActorRole("customer"), getCustomerBookingConsent)

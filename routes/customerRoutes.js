@@ -20,6 +20,7 @@ var {
   changeImage,
   updateUserBike,
   getMyBikes,
+  setPrimaryBike,
   deleteMyBike,
   addUserBike,
   getcustomersData,
@@ -60,6 +61,7 @@ router.post(
   addProfile,
 )
 router.get("/getMyBikes", requireCustomer, getMyBikes)
+router.put("/primary-bike", requireCustomer, setPrimaryBike)
 router.post("/deleteMyBike/:bike_id", requireCustomer, requireOwnedBike("bike_id"), deleteMyBike)
 router.post("/addUserBike", requireCustomer, addUserBike)
 

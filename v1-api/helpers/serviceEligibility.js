@@ -132,8 +132,19 @@ const BIKE_POPULATE = {
  */
 async function resolveBikeContextsForUser(userId) {
   if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return []
-  const bikes = await UserBike.find({ user_id: userId }).populate(BIKE_POPULATE)
-  return bikes.map(toBikeContext).filter(Boolean)
+  const bikes = await UserBike.find({ user_id: userId, status: { $ne: 0 } }).sort({ createdAt: 1, _id: 1 }).populate(BIKE_POPULATE)
+  let customer = null
+  try {
+    customer = await UserBike.db.model("customers").findById(userId).select("primaryBikeId").lean()
+  } catch (error) {
+    if (error?.name !== "MissingSchemaError") throw error
+  }
+  const storedId = customer?.primaryBikeId ? String(customer.primaryBikeId) : null
+  const chosen = bikes.some(bike => String(bike._id) === storedId) ? storedId : String(bikes[0]?._id || "")
+  return bikes.map(bike => {
+    const context = toBikeContext(bike)
+    return context ? { ...context, isPrimary: context.bikeId === chosen } : null
+  }).filter(Boolean)
 }
 
 /** A single saved bike, optionally pinned to its owner. */
@@ -170,10 +181,12 @@ async function resolveDiscoveryBikeContexts({ userId = null, bikeId = null, bike
 
   if (userId) {
     const contexts = await resolveBikeContextsForUser(userId)
-    return { contexts, source: contexts.length ? "user" : "none" }
+    const storedId = contexts.find(ctx => ctx.isPrimary)?.bikeId || null
+    const primaryBikeId = contexts.some(ctx => ctx.bikeId === storedId) ? storedId : contexts[0]?.bikeId || null
+    return { contexts, primaryBikeId, source: contexts.length ? "user" : "none" }
   }
 
-  return { contexts: [], source: "none" }
+  return { contexts: [], primaryBikeId: null, source: "none" }
 }
 
 function normalizeIdList(value) {

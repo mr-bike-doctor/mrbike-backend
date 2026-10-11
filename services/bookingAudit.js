@@ -37,7 +37,7 @@ function createAdminBookingAuditEvent({
   };
 }
 
-async function saveBookingWithAdminAudit(document, auditEvent) {
+async function saveBookingWithAdminAudit(document, auditEvent, { beforeAudit } = {}) {
   const mongoose = require("mongoose");
   const AdminBookingAudit = require("../models/AdminBookingAudit");
   const session = await mongoose.startSession();
@@ -56,6 +56,7 @@ async function saveBookingWithAdminAudit(document, auditEvent) {
       }
       transactionAttempt += 1;
       await document.save({ session });
+      if (beforeAudit) await beforeAudit(session);
       await AdminBookingAudit.create([auditEvent], { session });
     });
   } finally {

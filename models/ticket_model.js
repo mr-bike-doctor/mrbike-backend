@@ -9,6 +9,7 @@ const ROLES = /** @type const */ ({
 const TICKET_STATUS = /** @type const */ ({
   OPEN: "Open",
   IN_PROGRESS: "In Progress",
+  RESOLVED: "Resolved",
   CLOSED: "Closed",
 })
 
@@ -195,7 +196,9 @@ TicketSchema.virtual("ticketId").get(function () {
 
 // Internal: recompute last message metadata
 TicketSchema.methods._recomputeLastMessage = function () {
-  const last = this.messages[this.messages.length - 1]
+  // Public list previews must never reveal an internal note. Keep the preview
+  // anchored to the latest customer/provider-visible message.
+  const last = [...this.messages].reverse().find((message) => !message.internal)
   if (last) {
     this.lastMessageAt = last.timestamp
     this.lastMessageText = (last.message && last.message.trim()) || last.attachments?.[0]?.name || "[attachment]"

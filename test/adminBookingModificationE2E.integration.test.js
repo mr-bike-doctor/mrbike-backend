@@ -65,6 +65,7 @@ function request(port, method, path, token, body, requestId) {
 
 const bookingDoc = (bookingId, status = "confirmed") => ({
   _id: bookingId, user_id: ids.customer, dealer_id: ids.dealer, userBike_id: ids.bike,
+  bookingId: `TEST-${bookingId}`,
   services: [ids.serviceBefore], additionalServices: [], status, pickupStatus: "pending",
   transportOption: "SELF_VISIT", serviceAmount: 100, subtotal: 100, customerTotal: 100,
   amountDue: 100, totalBill: 100, billStatus: "pending", billGenerated: false,

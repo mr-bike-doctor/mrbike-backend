@@ -8,17 +8,24 @@ const {
     updateTicketStatus,
     getTicketById,
     getSupportUnreadCount,
-    markTicketRead
+    markTicketRead,
+    createAdminBookingTicket,
+    assignBookingTicket,
+    getBookingSupportAssignees,
 } = require("../controller/ticketController");
 const { requireAdmin } = require("../middlewares/requireAdmin");
 const { requireOwnTicketList, requireTicketParticipant } = require("../middlewares/ticketAuth");
 const { requireAdminBookingPermission } = require("../middlewares/adminBookingPermissions");
+const { requireBookingParticipant, requireActorRole } = require("../middlewares/bookingAuth");
 
 // requireOwnTicketList checks req.params.user_id against the authenticated
 // actor (customer or dealer) and sets req.auth/req.user_id — the same
 // ownership check a ticket-create needs, so it's reused here as well.
 router.post("/create/:user_id", requireOwnTicketList, createTicket);
 router.post("/reply/:ticket_id", requireTicketParticipant("ticket_id"), requireAdminBookingPermission("booking.complaint_manage"), replyToTicket);
+router.post("/booking/:bookingId", requireBookingParticipant(req => req.params.bookingId), requireActorRole("admin"), requireAdminBookingPermission("booking.complaint_manage"), createAdminBookingTicket);
+router.get("/booking-assignees", requireAdmin, requireAdminBookingPermission("booking.complaint_manage"), getBookingSupportAssignees);
+router.post("/booking-case/:ticket_id/assignee", requireTicketParticipant("ticket_id"), requireActorRole("admin"), requireAdminBookingPermission("booking.complaint_manage"), assignBookingTicket);
 router.get("/my-tickets/:user_id", requireOwnTicketList, getMyTickets);
 router.get("/user-dealer", requireAdmin, requireAdminBookingPermission("booking.complaint_manage"), getAllUserAndDealerTickets);
 router.post("/status/:ticket_id", requireTicketParticipant("ticket_id"), requireAdminBookingPermission("booking.complaint_manage"), updateTicketStatus);

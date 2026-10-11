@@ -80,6 +80,14 @@ function createBookingRoomJoinHandler(authorize = authorizeBookingRoom) {
     try {
       if (await authorize(this.data?.actor, bookingId)) {
         this.join(`booking:${bookingId}`);
+        // Recheck after joining. If a reassignment committed while the first
+        // database read was in flight, the just-connected old provider is
+        // immediately removed instead of retaining the previous room grant.
+        if (!(await authorize(this.data?.actor, bookingId))) {
+          this.leave(`booking:${bookingId}`);
+          this.emit("booking:joinUserDenied", { bookingId, reason: "unauthorized" });
+          return;
+        }
         this.emit("booking:joinUserAccepted", { bookingId });
         return;
       }

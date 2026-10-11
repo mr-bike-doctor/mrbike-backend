@@ -3,6 +3,7 @@ const assert = require("assert");
 const mongoose = require("mongoose");
 const GarageSlotCapacity = require("../models/GarageSlotCapacity");
 const BookingSlotReservation = require("../models/BookingSlotReservation");
+const Booking = require("../models/Booking");
 const { reserveBookingSlot, checkSlotAvailability, capacityId, SlotUnavailableError } = require("../services/bookingSlotReservations");
 
 if (!process.env.TEST_MONGO_URL) {
@@ -17,6 +18,13 @@ async function inTransaction(work) {
   const session = await mongoose.startSession();
   try { return await session.withTransaction(() => work(session)); }
   finally { await session.endSession(); }
+}
+
+async function reserveAndPersist(booking, dealerId, scheduleDate, timeSlot, hadPreviousSchedule) {
+  return inTransaction(async (session) => {
+    await reserveBookingSlot({ booking, scheduleDate, timeSlot, hadPreviousSchedule, session });
+    await Booking.updateOne({ _id: booking._id }, { $set: { dealer_id: dealerId, scheduleDate, timeSlot, status: "confirmed" } }, { upsert: true, session });
+  });
 }
 
 (async () => {
@@ -40,6 +48,7 @@ async function inTransaction(work) {
       { _id: capacityId(dealerId, day, rollbackSlot), dealerId, scheduleDate: day, timeSlot: rollbackSlot, capacity: 1, reservedCount: 0 },
     ]);
     const booking = { _id: bookingIds[0], dealer_id: dealerId };
+    await Booking.collection.insertOne({ _id: booking._id, bookingId: `TEST-${booking._id}`, dealer_id: dealerId, scheduleDate: day, timeSlot: oldSlot, status: "confirmed" });
     await BookingSlotReservation.create({ bookingId: booking._id, dealerId, scheduleDate: day, timeSlot: oldSlot });
 
     process.env.ENABLE_BOOKING_SLOT_RESERVATIONS = "true";
@@ -47,7 +56,7 @@ async function inTransaction(work) {
     await assert.rejects(checkSlotAvailability({ booking: { _id: bookingIds[1], dealer_id: dealerId }, scheduleDate: day, timeSlot: "unconfigured" }), (error) => error instanceof SlotUnavailableError && error.code === "SCHEDULE_AVAILABILITY_UNVERIFIED");
     await assert.rejects(checkSlotAvailability({ booking: { _id: bookingIds[1], dealer_id: dealerId }, scheduleDate: day, timeSlot: oldSlot }), (error) => error instanceof SlotUnavailableError && error.code === "SCHEDULE_SLOT_UNAVAILABLE");
     await assert.rejects(checkSlotAvailability({ booking: { _id: bookingIds[1], dealer_id: dealerId, scheduleDate: day, timeSlot: oldSlot }, scheduleDate: day, timeSlot: targetSlot }), (error) => error instanceof SlotUnavailableError && error.code === "SCHEDULE_RESERVATION_BASELINE_MISSING");
-    await inTransaction((session) => reserveBookingSlot({ booking, scheduleDate: day, timeSlot: targetSlot, hadPreviousSchedule: true, session }));
+    await reserveAndPersist(booking, dealerId, day, targetSlot, true);
     const [releasedOld, claimedTarget, movedReservation] = await Promise.all([
       GarageSlotCapacity.findById(capacityId(dealerId, day, oldSlot)).lean(),
       GarageSlotCapacity.findById(capacityId(dealerId, day, targetSlot)).lean(),
@@ -58,8 +67,9 @@ async function inTransaction(work) {
     assert.strictEqual(movedReservation.timeSlot, targetSlot);
 
     const raceBookings = [bookingIds[1], bookingIds[2]];
-    const raced = await Promise.allSettled(raceBookings.map((bookingId) => inTransaction((session) => reserveBookingSlot({ booking: { _id: bookingId, dealer_id: dealerId }, scheduleDate: day, timeSlot: raceSlot, hadPreviousSchedule: false, session }))));
-    assert.strictEqual(raced.filter((result) => result.status === "fulfilled").length, 1, "capacity-one slot admits only one concurrent reservation");
+    await Booking.collection.insertMany(raceBookings.map((bookingId) => ({ _id: bookingId, bookingId: `TEST-${bookingId}`, dealer_id: dealerId, status: "pending" })));
+    const raced = await Promise.allSettled(raceBookings.map((bookingId) => reserveAndPersist({ _id: bookingId, dealer_id: dealerId }, dealerId, day, raceSlot, false)));
+    assert.strictEqual(raced.filter((result) => result.status === "fulfilled").length, 1, `capacity-one slot admits only one concurrent reservation: ${JSON.stringify(raced.map((result) => result.status === "rejected" ? String(result.reason?.stack || result.reason) : "committed"))}`);
     const [raceCapacity, raceReservations] = await Promise.all([
       GarageSlotCapacity.findById(capacityId(dealerId, day, raceSlot)).lean(),
       BookingSlotReservation.countDocuments({ dealerId, scheduleDate: day, timeSlot: raceSlot }),
@@ -69,8 +79,10 @@ async function inTransaction(work) {
 
     const rollbackId = new mongoose.Types.ObjectId();
     bookingIds.push(rollbackId);
+    await Booking.collection.insertOne({ _id: rollbackId, bookingId: `TEST-${rollbackId}`, dealer_id: dealerId, status: "pending" });
     await assert.rejects(inTransaction(async (session) => {
       await reserveBookingSlot({ booking: { _id: rollbackId, dealer_id: dealerId }, scheduleDate: day, timeSlot: rollbackSlot, hadPreviousSchedule: false, session });
+      await Booking.updateOne({ _id: rollbackId }, { $set: { dealer_id: dealerId, scheduleDate: day, timeSlot: rollbackSlot, status: "pending" } }, { session });
       throw new Error("force transaction rollback");
     }));
     assert.strictEqual((await GarageSlotCapacity.findById(capacityId(dealerId, day, rollbackSlot)).lean()).reservedCount, 0, "failed surrounding transaction rolls back slot increment");
@@ -81,6 +93,7 @@ async function inTransaction(work) {
       await Promise.all([
         GarageSlotCapacity.deleteMany({ dealerId }),
         BookingSlotReservation.deleteMany({ bookingId: { $in: bookingIds } }),
+        Booking.deleteMany({ _id: { $in: bookingIds } }),
       ]);
     }
     await mongoose.disconnect();

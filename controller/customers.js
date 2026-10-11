@@ -285,6 +285,12 @@ const deleteMyBike = async (req, res) => {
       });
     }
 
+    const primaryOwner = await customers.findOne({ _id: user_id, primaryBikeId: deletedBike._id }).select("_id").lean();
+    if (primaryOwner) {
+      const replacement = await UserBike.findOne({ user_id, status: { $ne: 0 } }).sort({ createdAt: 1, _id: 1 }).select("_id").lean();
+      await customers.updateOne({ _id: user_id, primaryBikeId: deletedBike._id }, { $set: { primaryBikeId: replacement?._id || null } });
+    }
+
     return res.status(200).json({
       status: 200,
       message: "Bike deleted successfully",
@@ -670,7 +676,14 @@ const getMyBikes = async (req, res) => {
     // Fetch user bikes and the most recent completed service for each bike.
     // The additive serviceInfo field keeps the existing response contract
     // intact for older clients.
-    const userBikes = await UserBike.find({ user_id }).lean();
+    const [userBikes, customer] = await Promise.all([
+      UserBike.find({ user_id, status: { $ne: 0 } }).sort({ createdAt: 1, _id: 1 }).lean(),
+      customers.findById(user_id).select("primaryBikeId").lean(),
+    ]);
+    const storedPrimaryId = customer?.primaryBikeId && userBikes.some(bike => String(bike._id) === String(customer.primaryBikeId))
+      ? String(customer.primaryBikeId)
+      : null;
+    const primaryBikeId = storedPrimaryId || (userBikes[0] ? String(userBikes[0]._id) : null);
     const bikeIds = userBikes.map((bike) => bike._id);
     const latestServices = bikeIds.length
       ? await Booking.aggregate([
@@ -686,7 +699,7 @@ const getMyBikes = async (req, res) => {
       // No maintenance interval is currently stored in the database, so do
       // not manufacture a due date. The nullable field is explicit and lets
       // clients render an honest "not scheduled" state.
-      return { ...bike, serviceInfo: { lastServiceDate, nextServiceDue: null } };
+      return { ...bike, isPrimary: String(bike._id) === primaryBikeId, serviceInfo: { lastServiceDate, nextServiceDue: null } };
     });
     console.log(
       `[getMyBikes] Found ${userBikes.length} bikes for user ID: ${user_id}`,
@@ -707,6 +720,27 @@ const getMyBikes = async (req, res) => {
       message: "Internal Server Error",
       data: [],
     });
+  }
+};
+
+const setPrimaryBike = async (req, res) => {
+  try {
+    const { bikeId } = req.body || {};
+    if (!mongoose.Types.ObjectId.isValid(bikeId)) {
+      return res.status(400).json({ success: false, message: "Valid bikeId is required" });
+    }
+    const bike = await UserBike.findOne({ _id: bikeId, user_id: req.user_id, status: { $ne: 0 } }).select("_id").lean();
+    if (!bike) return res.status(404).json({ success: false, message: "Active bike not found" });
+    const customer = await customers.findByIdAndUpdate(
+      req.user_id,
+      { $set: { primaryBikeId: bike._id } },
+      { new: true, projection: { primaryBikeId: 1 } },
+    ).lean();
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
+    return res.status(200).json({ success: true, message: "Primary bike updated", data: { primaryBikeId: String(customer.primaryBikeId) } });
+  } catch (error) {
+    console.error("setPrimaryBike error:", error);
+    return res.status(500).json({ success: false, message: "Internal Server Error" });
   }
 };
 
@@ -1303,6 +1337,7 @@ module.exports = {
   changeImage,
   updateUserBike,
   getMyBikes,
+  setPrimaryBike,
   deleteMyBike,
   addUserBike,
   getcustomersData,

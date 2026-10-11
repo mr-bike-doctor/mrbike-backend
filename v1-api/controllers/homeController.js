@@ -78,6 +78,12 @@ async function homeFeed(req, res) {
             feedSection("explore", "Explore Services", "services", [], 12),
             feedSection("topGarages", "Top Rated Garages", "garages", [], 5),
           ],
+          primaryBike: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId)
+            ? { bikeId: primaryBikeId, name: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId).bikeName }
+            : null,
+          primaryBike: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId)
+            ? { bikeId: primaryBikeId, name: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId).bikeName }
+            : null,
           emptyState: { key: "coverage", message: "Services are not available in this area yet", action: "changeLocation" },
         },
         meta: scopeMeta(scope, bikeContexts, context.primaryBikeId),
@@ -218,6 +224,9 @@ async function homeFeed(req, res) {
       message: "Home feed fetched",
       data: {
         sections,
+        primaryBike: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId)
+          ? { bikeId: primaryBikeId, name: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId).bikeName }
+          : null,
         emptyState: rankedServices.length
           ? null
           : { key: "coverage", message: "Services are not available in this area yet", action: "changeLocation" },

@@ -6,6 +6,7 @@ const AdminService = require("../models/adminService");
 const AdditionalService = require("../models/additionalServiceSchema");
 const UserBike = require("../models/userBikeModel");
 const Vendor = require("../models/dealerModel");
+const GarageSlotCapacity = require("../models/GarageSlotCapacity");
 const {
   computePriceBreakdown,
   resolveServiceAmount,
@@ -24,12 +25,13 @@ const { sendBookingNotification } = require("../helper/pushNotification");
 const { hasAdminBookingPermission } = require("../middlewares/adminBookingPermissions");
 const { verifyAddressCoordinates } = require("../services/addressCoordinateValidation");
 const { persistApprovedBookingModification, ConsentAlreadyResolvedError } = require("../services/adminBookingModificationTransaction");
-const { checkSlotAvailability, reserveBookingSlot, SlotUnavailableError, reservationsReady } = require("../services/bookingSlotReservations");
+const { checkSlotAvailability, checkBookingScheduleReadiness, inspectAuthoritativeSlot, capacityId, reserveBookingSlot, SlotUnavailableError } = require("../services/bookingSlotReservations");
 
 const TERMINAL = new Set(["rejected", "user_cancelled", "cancelled", "expired", "delivered"]);
 const SERVICE_LOCKED = new Set(["completed", "awaiting_payment", "ready_for_delivery", "delivered"]);
 const SERVICE_CAP = 30;
 const LOCATION_FIELDS = ["pickupLocation", "deliveryLocation"];
+const PICKUP_NOT_STARTED = new Set(["pending", "booking_confirmed"]);
 const PRICE_FIELDS = [
   "serviceAmount", "serviceLines", "pickupCharges", "dropCharges", "towingCharge",
   "subtotal", "taxRate", "taxAmount", "platformFee", "platformFeeLabel",
@@ -75,9 +77,39 @@ function editableState(doc, plan) {
   if (plan.deliveryLocation && ["OUT_FOR_DELIVERY", "ARRIVED_AT_CUSTOMER", "DELIVERED"].includes(String(doc.deliveryTransportStatus || "").toUpperCase())) {
     throw new ModificationError(409, "DELIVERY_LOCATION_LOCKED", "Delivery location is locked after the delivery trip begins.");
   }
-  if (plan.schedule && (!(["pending", "confirmed"].includes(doc.status)) || pickupDone)) {
-    throw new ModificationError(409, "SCHEDULE_LOCKED", "Schedule can only change before pickup and service completion.");
+  if (plan.schedule) {
+    const blockedReason = scheduleChangeBlockedReason(doc);
+    if (blockedReason) throw new ModificationError(409, "SCHEDULE_LOCKED", blockedReason);
   }
+}
+
+function scheduleChangeBlockedReason(doc) {
+  if (!["pending", "confirmed"].includes(doc.status)) return "Rescheduling is allowed only for pending or confirmed bookings before pickup, service, payment, delivery, or closure.";
+  const pickupStatus = String(doc.pickupStatus || "pending").toLowerCase();
+  if (!PICKUP_NOT_STARTED.has(pickupStatus) || doc.pickupTrackingActive === true || doc.pickupStartedAt || doc.riderNearbyAt || doc.arrivedAt || doc.pickupOtpVerifiedAt || doc.pickupCompletedAt || doc.pickupCurrentLocation?.updatedAt) {
+    return "Pickup activity has started. Rescheduling is disabled once the provider begins traveling, arrives, verifies pickup, or collects the bike.";
+  }
+  if ((doc.garageTransportStatus && doc.garageTransportStatus !== "NOT_STARTED") || doc.garageTransportStartedAt || doc.garageArrivedAt) {
+    return "Garage transport or garage arrival has started. Rescheduling is disabled after pickup handoff.";
+  }
+  if ((doc.deliveryTransportStatus && doc.deliveryTransportStatus !== "NOT_STARTED") || doc.deliveryTransportStartedAt || doc.deliveryArrivedAt || doc.deliveryTransportCompletedAt) {
+    return "Delivery activity has started. This booking cannot be rescheduled.";
+  }
+  if (doc.billGenerated || doc.billStatus === "paid" || doc.payment_status === "completed") {
+    return "Billing or payment has started. This booking cannot be rescheduled.";
+  }
+  if (doc.serviceDate) return "Service has started or completed. This booking cannot be rescheduled.";
+  return "";
+}
+
+function localScheduleDate(now = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+}
+
+function isValidFutureScheduleDate(date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date && date >= localScheduleDate();
 }
 
 function planFromBody(body) {
@@ -225,7 +257,7 @@ function assertPlanPermissions(req, plan) {
 
 async function getAdminBookingModificationCatalog(req, res) {
   try {
-    const doc = await Booking.findById(req.params.bookingId).select("user_id dealer_id userBike_id services additionalServices status");
+    const doc = await Booking.findById(req.params.bookingId).select("user_id dealer_id userBike_id services additionalServices status scheduleDate timeSlot billGenerated billStatus payment_status serviceDate pickupStatus pickupStartedAt riderNearbyAt arrivedAt pickupOtpVerifiedAt pickupCompletedAt pickupTrackingActive pickupCurrentLocation garageTransportStatus garageTransportStartedAt garageArrivedAt deliveryTransportStatus deliveryTransportStartedAt deliveryArrivedAt deliveryTransportCompletedAt");
     if (!doc) return res.status(404).json({ success: false, message: "Booking not found" });
     const bikeData = await UserBike.findById(doc.userBike_id).select("bike_cc variant_id").populate({ path: "variant_id", select: "model_id engine_cc" }).lean();
     if (!bikeData) return res.status(409).json({ success: false, message: "Booking vehicle is unavailable." });
@@ -240,10 +272,50 @@ async function getAdminBookingModificationCatalog(req, res) {
       const row = findPriceRowForCC(item, bikeCC, context);
       return row ? { _id: String(item._id), name: item.base_service_id?.name || item.name || "Service", description: item.description || item.base_service_id?.description || "", price: Number(row.price) || 0 } : null;
     }).filter(Boolean);
-    return res.json({ success: true, data: { services: eligible(services), additionalServices: eligible(addOns), vehicles, selectedServices: (doc.services || []).map(String), selectedAdditionalServices: (doc.additionalServices || []).map(String), scheduleChangesEnabled: await reservationsReady() } });
+    const lifecycleReason = scheduleChangeBlockedReason(doc);
+    let capacityReady = false;
+    let capacityReason = "Garage slot capacity and existing booking reservations are not verified. Rescheduling remains disabled until authoritative capacity is configured and reconciled.";
+    if (!lifecycleReason) {
+      try {
+        await checkBookingScheduleReadiness(doc);
+        capacityReady = true;
+      } catch (error) {
+        if (!(error instanceof SlotUnavailableError)) throw error;
+        capacityReason = error.message;
+      }
+    }
+    const scheduleChangeBlockedReasonText = lifecycleReason || (capacityReady ? "" : capacityReason);
+    const scheduleChangesEnabled = capacityReady && !lifecycleReason;
+    return res.json({ success: true, data: { services: eligible(services), additionalServices: eligible(addOns), vehicles, selectedServices: (doc.services || []).map(String), selectedAdditionalServices: (doc.additionalServices || []).map(String), scheduleChangesEnabled, scheduleChangeBlockedReason: scheduleChangeBlockedReasonText } });
   } catch (error) {
     console.error("[admin-booking-modification] catalog failed:", error.message);
     return res.status(500).json({ success: false, message: "Unable to load eligible booking options." });
+  }
+}
+
+async function getAdminBookingScheduleSlots(req, res) {
+  try {
+    const doc = await Booking.findById(req.params.bookingId).select("dealer_id scheduleDate timeSlot status billGenerated billStatus payment_status serviceDate pickupStatus pickupStartedAt riderNearbyAt arrivedAt pickupOtpVerifiedAt pickupCompletedAt pickupTrackingActive pickupCurrentLocation garageTransportStatus garageTransportStartedAt garageArrivedAt deliveryTransportStatus deliveryTransportStartedAt deliveryArrivedAt deliveryTransportCompletedAt");
+    if (!doc) return res.status(404).json({ success: false, message: "Booking not found" });
+    const lifecycleReason = scheduleChangeBlockedReason(doc);
+    if (lifecycleReason) return res.status(409).json({ success: false, code: "SCHEDULE_LOCKED", message: lifecycleReason });
+    const date = String(req.query.date || "").trim();
+    if (!isValidFutureScheduleDate(date)) return res.status(400).json({ success: false, code: "INVALID_SCHEDULE", message: "Choose today or a future date to view available garage slots." });
+    await checkBookingScheduleReadiness(doc);
+    const rows = await GarageSlotCapacity.find({ dealerId: doc.dealer_id, scheduleDate: date, active: true }).sort({ timeSlot: 1 }).lean();
+    const available = [];
+    for (const row of rows) {
+      const slot = await inspectAuthoritativeSlot({ dealerId: doc.dealer_id, scheduleDate: date, timeSlot: row.timeSlot });
+      const isCurrentSlot = doc.scheduleDate === date && doc.timeSlot === row.timeSlot;
+      if (slot.capacity.reservedCount < slot.capacity.capacity || isCurrentSlot) {
+        available.push({ timeSlot: row.timeSlot, remaining: Math.max(0, slot.capacity.capacity - slot.capacity.reservedCount), current: isCurrentSlot });
+      }
+    }
+    return res.json({ success: true, data: { scheduleDate: date, slots: available } });
+  } catch (error) {
+    if (error instanceof SlotUnavailableError) return res.status(error.status).json({ success: false, code: error.code, message: error.message });
+    console.error("[admin-booking-modification] schedule slots failed:", error.message);
+    return res.status(503).json({ success: false, code: "SCHEDULE_AVAILABILITY_UNVERIFIED", message: "Garage slot availability could not be verified. No schedule options are available." });
   }
 }
 
@@ -313,8 +385,8 @@ async function applyPlan(doc, body) {
   if (plan.schedule) {
     const date = body.scheduleDate == null ? "" : String(body.scheduleDate).trim();
     const slot = body.timeSlot == null ? "" : String(body.timeSlot).trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !slot || slot.length > 80 || !Number.isFinite(Date.parse(`${date}T00:00:00`))) {
-      throw new ModificationError(400, "INVALID_SCHEDULE", "Choose a valid date and time slot.");
+    if (!isValidFutureScheduleDate(date) || !slot || slot.length > 80) {
+      throw new ModificationError(400, "INVALID_SCHEDULE", "Choose a real date today or later and a valid time slot.");
     }
     doc.scheduleDate = date;
     doc.timeSlot = slot;
@@ -386,7 +458,7 @@ async function applyAdminBookingModification(req, res) {
       if (!consent) throw new ModificationError(409, "CUSTOMER_CONSENT_REQUIRED", "The customer has not approved these exact changes, or the booking changed after approval.");
       const { before, after } = await applyPlan(doc, body);
       if (before.scheduleDate !== after.scheduleDate || before.timeSlot !== after.timeSlot) {
-        await reserveBookingSlot({ booking: doc, scheduleDate: doc.scheduleDate, timeSlot: doc.timeSlot, hadPreviousSchedule: Boolean(before.scheduleDate || before.timeSlot), session });
+        await reserveBookingSlot({ booking: doc, scheduleDate: doc.scheduleDate, timeSlot: doc.timeSlot, hadPreviousSchedule: Boolean(before.scheduleDate || before.timeSlot), previousScheduleDate: before.scheduleDate, previousTimeSlot: before.timeSlot, session });
       }
       const adminFields = ["services", "additionalServices", ...LOCATION_FIELDS, "pickupAddress", "scheduleDate", "timeSlot", "pickupDate", "userBike_id", ...PRICE_FIELDS];
       const auditEvent = createAdminBookingAuditEvent({
@@ -416,15 +488,15 @@ async function applyAdminBookingModification(req, res) {
   // transaction committed. Historical tracking points are never edited.
   try {
     const customer = await require("../models/customer_model").findById(committed.customerId).select("device_token ftoken").lean();
-    await sendBookingNotification({ token: customer?.device_token || customer?.ftoken, title: "Your booking was updated", body: "An MR Bike support agent updated your booking. Open the app to review the latest details.", data: { type: "booking_updated", bookingId }, receiverId: committed.customerId, receiverType: "user", bookingId });
+    await sendBookingNotification({ token: customer?.device_token || customer?.ftoken, title: "Your booking was updated", body: "An MR Bike support agent updated your booking. Open the app to review the latest details.", data: { type: "booking_updated", bookingId, scheduleDate: committed.data.scheduleDate, timeSlot: committed.data.timeSlot }, receiverId: committed.customerId, receiverType: "user", bookingId });
   } catch (error) { console.error("[admin-booking-modification] customer notification failed:", error.message); }
   try {
     const dealer = await Vendor.findById(committed.dealerId).select("device_token ftoken").lean();
-    await sendBookingNotification({ token: dealer?.device_token || dealer?.ftoken, title: "Booking details updated", body: "MR Bike support updated a booking assigned to your garage. Refresh the booking before acting.", data: { type: "booking_updated", bookingId }, receiverId: committed.dealerId, receiverType: "dealer", bookingId });
+    await sendBookingNotification({ token: dealer?.device_token || dealer?.ftoken, title: "Booking details updated", body: "MR Bike support updated a booking assigned to your garage. Refresh the booking before acting.", data: { type: "booking_updated", bookingId, scheduleDate: committed.data.scheduleDate, timeSlot: committed.data.timeSlot }, receiverId: committed.dealerId, receiverType: "dealer", bookingId });
   } catch (error) { console.error("[admin-booking-modification] provider notification failed:", error.message); }
   const io = req.app.get("io");
   const locationUpdate = { pickupLocation: committed.data.pickupLocation, deliveryLocation: committed.data.deliveryLocation };
-  if (io) io.to(`booking:${bookingId}`).emit("booking:updated", { bookingId, status: committed.data.status, ...locationUpdate });
+  if (io) io.to(`booking:${bookingId}`).emit("booking:updated", { bookingId, status: committed.data.status, scheduleDate: committed.data.scheduleDate, timeSlot: committed.data.timeSlot, ...locationUpdate });
   const updated = await Booking.findById(bookingId)
     .populate({ path: "services", select: "_id name description image" })
     .populate({ path: "additionalServices", select: "_id description base_additional_service_id", populate: { path: "base_additional_service_id", select: "name image description" } })
@@ -438,6 +510,7 @@ module.exports = {
   respondToBookingConsent,
   getAdminBookingConsentStatus,
   getAdminBookingModificationCatalog,
+  getAdminBookingScheduleSlots,
   previewAdminBookingModification,
   applyAdminBookingModification,
   _test: { normalizeLocation, editableState, planFromBody, requiresConsent, assertPlanPermissions, assertScheduleAvailability, changesHash, requestedChanges, validateLocationChanges, ModificationError },

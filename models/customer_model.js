@@ -62,6 +62,11 @@ const CustomerSchema = new mongoose.Schema(
         default: [],
       },
     ],
+    primaryBikeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "UserBike",
+      default: null,
+    },
     otp: {
       type: Number,
       default: null,

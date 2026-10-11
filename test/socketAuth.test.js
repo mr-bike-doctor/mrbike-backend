@@ -75,7 +75,10 @@ async function run() {
     user_id: CUSTOMER_ID, dealer_id: DEALER_ID,
   }), true, "manager can join authorized live booking rooms");
 
-  const bookingModel = modelFind({ user_id: CUSTOMER_ID, dealer_id: DEALER_ID });
+  let currentBooking = { user_id: CUSTOMER_ID, dealer_id: DEALER_ID };
+  const bookingModel = {
+    findById: () => ({ select: () => ({ lean: async () => currentBooking }) }),
+  };
   assert.strictEqual(await authorizeBookingRoom(
     { role: "customer", id: CUSTOMER_ID }, BOOKING_ID, bookingModel,
   ), true);
@@ -104,6 +107,32 @@ async function run() {
   await joinHandler.call(socketContext, { bookingId: BOOKING_ID });
   assert.deepStrictEqual(left, [`booking:${BOOKING_ID}`], "unauthorized client is removed from booking room");
   assert.strictEqual(emitted.at(-1).event, "booking:joinUserDenied");
+
+  // A provider reconnecting after reassignment is authorized against the
+  // current booking owner, rather than a stale socket token or prior room.
+  currentBooking = { user_id: CUSTOMER_ID, dealer_id: OTHER_ID };
+  assert.strictEqual(await authorizeBookingRoom({ role: "dealer", id: DEALER_ID }, BOOKING_ID, bookingModel), false,
+    "old provider cannot reconnect to the booking room after reassignment");
+  assert.strictEqual(await authorizeBookingRoom({ role: "dealer", id: OTHER_ID }, BOOKING_ID, bookingModel), true,
+    "replacement provider can subscribe after reassignment");
+  socketContext.data.actor = { role: "dealer", id: DEALER_ID };
+  await joinHandler.call(socketContext, { bookingId: BOOKING_ID });
+  assert.strictEqual(emitted.at(-1).event, "booking:joinUserDenied", "old provider reconnect is denied by the room handler");
+  socketContext.data.actor = { role: "dealer", id: OTHER_ID };
+  await joinHandler.call(socketContext, { bookingId: BOOKING_ID });
+  assert.strictEqual(emitted.at(-1).event, "booking:joinUserAccepted", "replacement provider can join after reassignment");
+
+  let authorizationReads = 0;
+  const racedJoin = createBookingRoomJoinHandler(async () => ++authorizationReads === 1);
+  const racedEvents = [];
+  const racedLeft = [];
+  await racedJoin.call({
+    data: { actor: { role: "dealer", id: DEALER_ID } },
+    join: () => {}, leave: (room) => racedLeft.push(room),
+    emit: (event) => racedEvents.push(event),
+  }, { bookingId: BOOKING_ID });
+  assert.deepStrictEqual(racedLeft, [`booking:${BOOKING_ID}`], "stale in-flight room authorization is revoked by the post-join recheck");
+  assert.strictEqual(racedEvents.at(-1), "booking:joinUserDenied");
 
   if (oldSecret === undefined) delete process.env.JWT_SECRET;
   else process.env.JWT_SECRET = oldSecret;
