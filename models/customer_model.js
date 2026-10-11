@@ -67,6 +67,9 @@ const CustomerSchema = new mongoose.Schema(
       ref: "UserBike",
       default: null,
     },
+    // Mutations increment this field in the same transaction so competing
+    // bike selection, deletion, and deactivation operations conflict.
+    primaryBikeRevision: { type: Number, default: 0, select: false },
     otp: {
       type: Number,
       default: null,

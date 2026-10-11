@@ -15,6 +15,7 @@ const MrBikeMoneyTransaction = require("../models/MrBikeMoneyTransaction");
 const { generateUniqueReferralCode } = require("../utils/referralCodeGenerator");
 const { awardReferralSignupRewardsIfEligible } = require("../services/referralRewardService");
 const { normalizePlateNumber } = require("../utils/plateNumber");
+const primaryBikeService = require("../services/primaryBikeService");
 
 async function getReferralSettingsSingleton() {
   let settings = await ReferralSettings.findOne({});
@@ -182,11 +183,10 @@ const updateUserBike = async (req, res) => {
       }
     }
 
-    // Update the bike details
-    const updatedBike = await UserBike.findOneAndUpdate({ _id: id, user_id: req.user_id }, updateData, {
-      new: true, // Return the updated document
-      runValidators: true, // Ensure validation rules are applied
-    });
+    // Status transitions share a transaction with the primary reference.
+    const updatedBike = updateData.status !== undefined
+      ? await primaryBikeService.updateCustomerBikeStatus({ userId: req.user_id, bikeId: id, status: updateData.status })
+      : await UserBike.findOneAndUpdate({ _id: id, user_id: req.user_id }, updateData, { new: true, runValidators: true });
 
     res.status(200).json({
       message: "Bike details updated successfully",
@@ -194,7 +194,7 @@ const updateUserBike = async (req, res) => {
     });
   } catch (error) {
     console.error("Update Error:", error);
-    res.status(500).json({ message: "Internal Server Error" });
+    res.status(error.status || 500).json({ success: false, code: error.code, message: error.message || "Internal Server Error" });
   }
 };
 
@@ -272,24 +272,7 @@ const deleteMyBike = async (req, res) => {
       });
     }
 
-    // Ownership check and deletion happen in one database operation. A success
-    // response therefore means the unique plate entry has actually gone and
-    // the same customer can immediately add that registration number again.
-    const deletedBike = await UserBike.findOneAndDelete({ _id: bike_id, user_id });
-
-    if (!deletedBike) {
-      return res.status(404).json({
-        status: 404,
-        message: "Bike not found!",
-        data: [],
-      });
-    }
-
-    const primaryOwner = await customers.findOne({ _id: user_id, primaryBikeId: deletedBike._id }).select("_id").lean();
-    if (primaryOwner) {
-      const replacement = await UserBike.findOne({ user_id, status: { $ne: 0 } }).sort({ createdAt: 1, _id: 1 }).select("_id").lean();
-      await customers.updateOne({ _id: user_id, primaryBikeId: deletedBike._id }, { $set: { primaryBikeId: replacement?._id || null } });
-    }
+    await primaryBikeService.deleteCustomerBike({ userId: user_id, bikeId: bike_id });
 
     return res.status(200).json({
       status: 200,
@@ -299,9 +282,10 @@ const deleteMyBike = async (req, res) => {
   } catch (error) {
     console.error("❌ Error deleting user bike:", error);
 
-    return res.status(500).json({
-      status: 500,
-      message: "Internal Server Error",
+    return res.status(error.status || 500).json({
+      status: error.status || 500,
+      code: error.code,
+      message: error.message || "Internal Server Error",
       data: [],
     });
   }
@@ -683,7 +667,7 @@ const getMyBikes = async (req, res) => {
     const storedPrimaryId = customer?.primaryBikeId && userBikes.some(bike => String(bike._id) === String(customer.primaryBikeId))
       ? String(customer.primaryBikeId)
       : null;
-    const primaryBikeId = storedPrimaryId || (userBikes[0] ? String(userBikes[0]._id) : null);
+    const primaryBikeId = primaryBikeService.primaryBikeIdForBikes(userBikes, storedPrimaryId);
     const bikeIds = userBikes.map((bike) => bike._id);
     const latestServices = bikeIds.length
       ? await Booking.aggregate([
@@ -715,8 +699,9 @@ const getMyBikes = async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching user bikes:", error);
-    res.status(200).json({
-      status: 200,
+    res.status(500).json({
+      success: false,
+      status: 500,
       message: "Internal Server Error",
       data: [],
     });
@@ -729,16 +714,10 @@ const setPrimaryBike = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(bikeId)) {
       return res.status(400).json({ success: false, message: "Valid bikeId is required" });
     }
-    const bike = await UserBike.findOne({ _id: bikeId, user_id: req.user_id, status: { $ne: 0 } }).select("_id").lean();
-    if (!bike) return res.status(404).json({ success: false, message: "Active bike not found" });
-    const customer = await customers.findByIdAndUpdate(
-      req.user_id,
-      { $set: { primaryBikeId: bike._id } },
-      { new: true, projection: { primaryBikeId: 1 } },
-    ).lean();
-    if (!customer) return res.status(404).json({ success: false, message: "Customer not found" });
-    return res.status(200).json({ success: true, message: "Primary bike updated", data: { primaryBikeId: String(customer.primaryBikeId) } });
+    const result = await primaryBikeService.setPrimaryBike({ userId: req.user_id, bikeId });
+    return res.status(200).json({ success: true, message: "Primary bike updated", data: result });
   } catch (error) {
+    if (error.status) return res.status(error.status).json({ success: false, code: error.code, message: error.message });
     console.error("setPrimaryBike error:", error);
     return res.status(500).json({ success: false, message: "Internal Server Error" });
   }

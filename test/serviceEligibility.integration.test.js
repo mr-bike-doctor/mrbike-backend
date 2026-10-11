@@ -12,6 +12,7 @@ const TEST_URL = process.env.TEST_MONGO_URL || "mongodb://127.0.0.1:27017/mrbike
 const BaseService = require("../models/baseService");
 const AdminService = require("../models/adminService");
 const UserBike = require("../models/userBikeModel");
+const Customer = require("../models/customer_model");
 const BikeVariant = require("../models/bikeVariantModel");
 const BikeModel = require("../models/bikeModel");
 const BikeCompany = require("../models/bikeCompanyModel");
@@ -108,6 +109,7 @@ async function countQueries(fn) {
 
 async function seed() {
   await Promise.all([
+    Customer.collection.insertOne({ _id: USER, primaryBikeId: BIKE_B }),
     BikeCompany.collection.insertMany([
       { _id: HONDA, name: "HONDA" },
       { _id: HERO, name: "HERO" },
@@ -233,9 +235,18 @@ async function run() {
   assert.deepStrictEqual(section("quickServices").items.map(item => item.name), ["Service 2"]);
   assert.deepStrictEqual(section("mostBooked").items, [], "dealer coverage must not be reported as bookings");
   assert.deepStrictEqual(section("recommended").items.map(item => item.name).sort(), ["Service 3", "Service 4", "Service 5"]);
+  assert.strictEqual(section("recommended").items[0].name, "Service 3", "primary-compatible service ranks first in recommendations");
+  assert.deepStrictEqual(section("recommended").items[0].compatibleBikeIds, [String(BIKE_B)]);
   const visibleServiceIds = feed.data.sections.flatMap(item => item.itemType === "services" ? item.items.map(service => String(service.serviceId)) : []);
   assert.strictEqual(new Set(visibleServiceIds).size, visibleServiceIds.length, "service cards must be deduplicated across sections");
+  assert.strictEqual(visibleServiceIds.length, 5, "services across every saved bike remain visible across the feed");
   assert.strictEqual(feed.data.emptyState, null);
+
+  await Customer.updateOne({ _id: USER }, { $set: { primaryBikeId: BIKE_C } });
+  const switchedPrimaryFeed = await call(homeController.homeFeed, req(here, { user_id: String(USER) }));
+  const switchedRecommended = switchedPrimaryFeed.data.sections.find(item => item.key === "recommended").items;
+  assert.deepStrictEqual(switchedRecommended.slice(0, 2).map(item => item.name), ["Service 4", "Service 5"], "changing the primary bike updates compatible-service ranking");
+  assert.strictEqual(switchedPrimaryFeed.data.sections.flatMap(item => item.itemType === "services" ? item.items : []).length, 5, "switching primary preserves the all-bike service union");
 
   const noBikeFeed = await call(homeController.homeFeed, req(here));
   assert.strictEqual(noBikeFeed.meta.bikeMatched, false);
@@ -251,8 +262,13 @@ async function run() {
     _id: id(901), dealer_id: D2, services: [service3AdminRow._id],
     userBike_id: BIKE_B, status: "completed", create_date: new Date(),
   });
+  const service4AdminRow = await AdminService.findOne({ base_service_id: SVC[4] }).select("_id").lean();
+  await Booking.collection.insertMany([
+    { _id: id(902), dealer_id: D2, services: [service4AdminRow._id], userBike_id: BIKE_C, status: "completed", create_date: new Date() },
+    { _id: id(903), dealer_id: D2, services: [service4AdminRow._id], userBike_id: BIKE_C, status: "completed", create_date: new Date() },
+  ]);
   const withRealPopularity = await call(homeController.homeFeed, req(here, { user_id: String(USER) }));
-  assert.deepStrictEqual(withRealPopularity.data.sections.find(item => item.key === "mostBooked").items.map(item => item.name), ["Service 3"]);
+  assert.deepStrictEqual(withRealPopularity.data.sections.find(item => item.key === "mostBooked").items.map(item => item.name), ["Service 4", "Service 3"], "Most Booked follows real popularity even when the more popular service is for another saved bike");
 
   const adminUpdateResponse = res();
   await baseServiceController.updateBaseService({
@@ -295,6 +311,10 @@ async function run() {
   assert.deepStrictEqual(forB.data.map(g => String(g.dealerId)), [String(D1)]);
   assert.strictEqual(forB.data[0].price, 700);
   assert.strictEqual(forB.meta.bikeMatched, true);
+
+  // The primary preference does not replace explicit booking-bike selection.
+  const forOtherSavedBike = await call(serviceController.garagesForService, req({ ...here, bikeId: String(BIKE_A) }, { params: { id: String(SVC[1]) }, user_id: String(USER) }));
+  assert.deepStrictEqual(forOtherSavedBike.data.map(g => String(g.dealerId)), [String(D1)]);
 
   // Service 3 is bike B's; bike A must get an honest empty list, not D2 anyway.
   const forA = await call(serviceController.garagesForService, req({ ...here, bikeId: String(BIKE_A) }, { params: { id: String(SVC[3]) }, user_id: String(USER) }));
@@ -364,7 +384,9 @@ async function run() {
 
   // Nothing may issue one query per service or per dealer.
   Object.entries(before).forEach(([name, ops]) => {
-    assert.ok(ops.length <= 10, `${name} issued ${ops.length} queries: ${ops.join(", ")}`);
+    // The composed feed now reads the customer's persisted primary preference
+    // once alongside the whole saved-bike context.
+    assert.ok(ops.length <= 11, `${name} issued ${ops.length} queries: ${ops.join(", ")}`);
   });
   if (process.env.PRINT_QUERY_PLAN) {
     Object.entries(before).forEach(([name, ops]) => console.log(`  ${name}: ${ops.length} — ${ops.join(", ")}`));

@@ -152,7 +152,7 @@ async function resolveBikeContextById(bikeId, userId = null) {
   if (!bikeId || !mongoose.Types.ObjectId.isValid(bikeId)) return null
   const filter = { _id: bikeId }
   if (userId && mongoose.Types.ObjectId.isValid(userId)) filter.user_id = userId
-  const bike = await UserBike.findOne(filter).populate(BIKE_POPULATE)
+  const bike = await UserBike.findOne({ ...filter, status: { $ne: 0 } }).populate(BIKE_POPULATE)
   return bike ? toBikeContext(bike) : null
 }
 
@@ -200,7 +200,7 @@ async function resolveBikeContextsByIds(ids, userId = null) {
   if (!ids.length) return []
   const filter = { _id: { $in: ids } }
   if (userId && mongoose.Types.ObjectId.isValid(userId)) filter.user_id = userId
-  const bikes = await UserBike.find(filter).populate(BIKE_POPULATE)
+  const bikes = await UserBike.find({ ...filter, status: { $ne: 0 } }).populate(BIKE_POPULATE)
   return bikes.map(toBikeContext).filter(Boolean)
 }
 

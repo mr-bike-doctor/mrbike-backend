@@ -81,9 +81,6 @@ async function homeFeed(req, res) {
           primaryBike: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId)
             ? { bikeId: primaryBikeId, name: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId).bikeName }
             : null,
-          primaryBike: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId)
-            ? { bikeId: primaryBikeId, name: bikeContexts.find(ctx => ctx.bikeId === primaryBikeId).bikeName }
-            : null,
           emptyState: { key: "coverage", message: "Services are not available in this area yet", action: "changeLocation" },
         },
         meta: scopeMeta(scope, bikeContexts, context.primaryBikeId),
