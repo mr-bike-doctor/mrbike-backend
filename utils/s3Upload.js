@@ -1,4 +1,5 @@
 const { S3Client, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { GetObjectCommand } = require("@aws-sdk/client-s3");
 const multer = require("multer");
 const multerS3 = require("multer-s3");
 const path = require("path");
@@ -12,6 +13,10 @@ const s3 = new S3Client({
 });
 
 const BUCKET = process.env.AWS_S3_BUCKET;
+
+async function getS3Object(key) {
+  return s3.send(new GetObjectCommand({Bucket: BUCKET, Key: key}));
+}
 
 // Defaults preserve the exact behavior every existing caller already relies
 // on. Note video types are deliberately absent: nothing in this codebase can
@@ -96,6 +101,7 @@ async function deleteS3Object(location) {
 module.exports = {
   createS3Upload,
   deleteS3Object,
+  getS3Object,
   DEFAULT_ALLOWED_EXTENSIONS,
   DEFAULT_MAX_FILE_SIZE_BYTES,
   BANNER_MAX_FILE_SIZE_BYTES,

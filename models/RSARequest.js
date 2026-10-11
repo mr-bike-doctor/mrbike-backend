@@ -33,6 +33,7 @@ const rsaRequestSchema = new mongoose.Schema({
   estimateVersion: {type:Number,default:0},
   estimateStatus: {type: String, enum: ['none','pending_customer','approved','declined'], default: 'none'},
   dealerWorkStatus: {type: String, default: ''},
+  serviceMode: {type:String,enum:['repair','towing'],default:null},
   repairStartedAt: {type:Date,default:null},
   paymentStatus: {type:String,enum:['not_required','pending','cash_confirmed'],default:'pending'},
   paymentAmount: {type:Number,min:0,default:null},

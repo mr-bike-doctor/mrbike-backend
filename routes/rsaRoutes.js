@@ -17,6 +17,9 @@ router.post('/requests', requireCustomer, wrap(controller.createRequest));
 router.get('/requests', requireCustomer, wrap(controller.customerRequests));
 router.get('/requests/:id', requireCustomer, wrap(controller.getCustomerRequest));
 router.post('/requests/:id/photo',requireCustomer,wrap(controller.authorizePhotoUpload),parsePhoto,wrap(controller.uploadRequestPhoto));
+router.get('/requests/:id/photos/:index',requireCustomer,wrap(controller.readRequestPhoto));
+router.get('/dealer/requests/:id/photos/:index',verifyDealerToken,wrap(controller.readRequestPhoto));
+router.get('/admin/requests/:id/photos/:index',requireAdmin,wrap(controller.readRequestPhoto));
 router.get('/dealer/requests/:id', verifyDealerToken, wrap(controller.getDealerRequest));
 router.patch('/requests/:id/cancel', requireCustomer, wrap(controller.cancelRequest));
 router.patch('/requests/:id/estimate', requireCustomer, wrap(controller.customerEstimateResponse));
@@ -30,6 +33,7 @@ router.patch('/dealer/requests/:id/towing',verifyDealerToken,wrap(controller.sta
 router.patch('/dealer/requests/:id/handover',verifyDealerToken,wrap(controller.verifyTowingHandover));
 router.patch('/dealer/requests/:id/cash',verifyDealerToken,wrap(controller.confirmCashReceived));
 router.patch('/requests/:id/completion',requireCustomer,wrap(controller.customerCompletion));
+router.patch('/requests/:id/towing-destination',requireCustomer,wrap(controller.setTowingDestination));
 
 router.get('/admin/services', requireAdmin, wrap(controller.adminServices));
 router.post('/admin/services', requireAdmin, wrap(controller.createService));
