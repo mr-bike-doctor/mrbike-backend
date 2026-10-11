@@ -299,8 +299,9 @@ const sensitiveRateLimit = require("./middlewares/rateLimits");
 const mongoose = require("mongoose");
 const Vendor = require("./models/dealerModel");
 const { isDealerBookable } = require("./helper/dealerStatus");
-const { createSocketAuthMiddleware, createBookingRoomJoinHandler } = require("./middlewares/socketAuth");
+const { createSocketAuthMiddleware, createBookingRoomJoinHandler, createRSARequestRoomJoinHandler } = require("./middlewares/socketAuth");
 const { ensureUserBikePlateIndexes } = require("./utils/userBikeIndexes");
+const rsaDispatch = require("./services/rsaDispatch");
 
 const app = express();
 const server = http.createServer(app);
@@ -386,6 +387,21 @@ io.on("connection", (socket) => {
   // Customer/provider tracking and booking updates share this room. Only a
   // booking participant (or an active admin) may subscribe to its events.
   socket.on("booking:joinUser", createBookingRoomJoinHandler());
+
+  // RSA rooms are separate from booking rooms; room access only grants status
+  // events, while REST refetch enforces the current offer/assignment for GPS.
+  socket.on("rsa:joinCustomer", createRSARequestRoomJoinHandler());
+
+  socket.on("rsa:joinDealer", async () => {
+    try {
+      if (socket.data.actor?.role !== "dealer") throw new Error("unauthorized");
+      const dealerId = String(socket.data.actor.id);
+      const dealer = await Vendor.findById(dealerId).select("online isBlocked isActive isDoc status registrationStatus dealerStatus").lean();
+      if (!isDealerBookable(dealer)) throw new Error("unauthorized");
+      socket.join(`dealer:${dealerId}`);
+      socket.emit("rsa:dealerJoinAccepted", {dealerId});
+    } catch (_error) { socket.emit("rsa:dealerJoinDenied", {reason: "unauthorized"}); }
+  });
 
   // Admin joins their personal room to receive support unread-count updates
   socket.on("admin:join", (payload = {}) => {
@@ -478,6 +494,7 @@ db.mongoose
     campaignSchedulerJob.start();
     reviewReminderJob.start();
     paymentReconciliationJob.start();
+    if (process.env.RSA_REQUESTS_ENABLED === "true") rsaDispatch.start(io);
     server.listen(PORT, () =>
       console.log(`Server is working on port: ${PORT}`)
     );

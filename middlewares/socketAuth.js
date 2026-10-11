@@ -4,6 +4,7 @@ const Customer = require("../models/customer_model");
 const Vendor = require("../models/dealerModel");
 const Admin = require("../models/admin_model");
 const Booking = require("../models/Booking");
+const RSARequest = require("../models/RSARequest");
 const { hasAdminBookingPermission } = require("./adminBookingPermissions");
 
 async function authenticateSocketToken(token, models = {}) {
@@ -99,10 +100,40 @@ function createBookingRoomJoinHandler(authorize = authorizeBookingRoom) {
   };
 }
 
+async function authorizeRSARequestRoom(actor, requestId, RequestModel = RSARequest) {
+  if (!actor || actor.role !== "customer" || !mongoose.Types.ObjectId.isValid(String(requestId || ""))) return false;
+  const request = await RequestModel.findById(requestId).select("customerId").lean();
+  return String(request?.customerId || "") === String(actor.id);
+}
+
+function createRSARequestRoomJoinHandler(authorize = authorizeRSARequestRoom) {
+  return async function joinRSARequestRoom(payload = {}) {
+    const requestId = String(payload?.requestId || "");
+    try {
+      if (await authorize(this.data?.actor, requestId)) {
+        const room = `rsa:customer:${this.data.actor.id}`;
+        this.join(room);
+        if (!(await authorize(this.data?.actor, requestId))) {
+          this.leave(room);
+          this.emit("rsa:joinDenied", {requestId, reason: "unauthorized"});
+          return;
+        }
+        this.emit("rsa:joinAccepted", {requestId});
+        return;
+      }
+    } catch (error) {
+      console.error("[SOCKET] RSA room authorization failed:", error.message);
+    }
+    this.emit("rsa:joinDenied", {requestId, reason: "unauthorized"});
+  };
+}
+
 module.exports = {
   authenticateSocketToken,
   createSocketAuthMiddleware,
   canJoinBookingRoom,
   authorizeBookingRoom,
   createBookingRoomJoinHandler,
+  authorizeRSARequestRoom,
+  createRSARequestRoomJoinHandler,
 };

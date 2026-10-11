@@ -7,6 +7,8 @@ const {
   canJoinBookingRoom,
   authorizeBookingRoom,
   createBookingRoomJoinHandler,
+  authorizeRSARequestRoom,
+  createRSARequestRoomJoinHandler,
 } = require("../middlewares/socketAuth");
 
 const CUSTOMER_ID = new mongoose.Types.ObjectId().toString();
@@ -74,6 +76,18 @@ async function run() {
   assert.strictEqual(canJoinBookingRoom({ role: "admin", adminRole: "Manager", id: ADMIN_ID }, {
     user_id: CUSTOMER_ID, dealer_id: DEALER_ID,
   }), true, "manager can join authorized live booking rooms");
+
+  const rsaModel={findById:()=>({select:()=>({lean:async()=>({customerId:CUSTOMER_ID})})})};
+  assert.strictEqual(await authorizeRSARequestRoom({role:"customer",id:CUSTOMER_ID},BOOKING_ID,rsaModel),true);
+  assert.strictEqual(await authorizeRSARequestRoom({role:"customer",id:OTHER_ID},BOOKING_ID,rsaModel),false,"other customer cannot join RSA updates");
+  assert.strictEqual(await authorizeRSARequestRoom({role:"dealer",id:DEALER_ID},BOOKING_ID,rsaModel),false,"dealer cannot join customer RSA room");
+  const rsaJoined=[],rsaEvents=[];
+  const rsaJoin=createRSARequestRoomJoinHandler(async(actor)=>actor?.id===CUSTOMER_ID);
+  await rsaJoin.call({data:{actor:{role:"customer",id:CUSTOMER_ID}},join:r=>rsaJoined.push(r),leave:()=>{},emit:e=>rsaEvents.push(e)},{requestId:BOOKING_ID});
+  assert.deepStrictEqual(rsaJoined,[`rsa:customer:${CUSTOMER_ID}`]);
+  assert.strictEqual(rsaEvents.at(-1),"rsa:joinAccepted");
+  await rsaJoin.call({data:{actor:{role:"dealer",id:DEALER_ID}},join:r=>rsaJoined.push(r),leave:()=>{},emit:e=>rsaEvents.push(e)},{requestId:BOOKING_ID});
+  assert.strictEqual(rsaEvents.at(-1),"rsa:joinDenied");
 
   let currentBooking = { user_id: CUSTOMER_ID, dealer_id: DEALER_ID };
   const bookingModel = {
