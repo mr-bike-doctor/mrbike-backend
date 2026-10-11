@@ -303,6 +303,7 @@ const dealerModel = new mongoose.Schema(
     // RSA is a separately granted capability and remains disabled unless an
     // admin explicitly enables it for this dealer.
     rsaEnabled: { type: Boolean, default: false, index: true },
+    rsaOnline: { type: Boolean, default: false, index: true },
     rsaCapabilities: { type: [String], enum: ["towing"], default: [] },
     rsaAvailableCapacity: { type: Number, min: 0, default: 0 },
     rsaCapacityLimit: { type: Number, min: 0, default: 0 },

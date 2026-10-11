@@ -35,6 +35,8 @@ const userBikeSchema = new mongoose.Schema(
       type: Number,
       default: 1, 
     },
+    // RSA-only write guard serializes concurrent active assistance requests per bike.
+    rsaRequestGuardVersion: { type: Number, default: 0, select: false },
   },
   { timestamps: true }
 );

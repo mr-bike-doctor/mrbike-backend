@@ -12,7 +12,7 @@ const BATCH_SIZE = boundedConfig(process.env.RSA_OFFER_BATCH_SIZE,3,1,5);
 const OFFER_TTL_MS = boundedConfig(process.env.RSA_OFFER_TTL_MS,90000,15000,10*60*1000);
 const id = x => String(x?._id || x || '');
 
-async function eligibleAt(serviceId, bikeId, location, session) {
+async function eligibleAt(serviceId, bikeId, location, session, lockAssignments = false, allowExistingOfferDealerId = null) {
   const service = await RSAService.findOne({_id: serviceId, isActive: true}).session(session).lean();
   if (!service) return {service: null, area: null, providers: []};
   const bike = await UserBike.findOne({_id: bikeId, status: 1}).session(session).lean();
@@ -22,12 +22,24 @@ async function eligibleAt(serviceId, bikeId, location, session) {
   const point = {type:'Point', coordinates:[location.longitude, location.latitude]};
   const area = await RSAArea.findOne({isActive:true,boundary:{$geoIntersects:{$geometry:point}}}).session(session).lean();
   if (!area) return {service, area: null, providers: []};
-  const offerings = await DealerRSAService.find({serviceId,priceStatus:'approved',dealerActive:true,approvedPrice:{$type:'number'}}).session(session).lean();
+  const offeringFilter={serviceId,revokedAt:null,priceStatus:'approved',approvedPrice:{$type:'number'}};
+  if(allowExistingOfferDealerId) offeringFilter.$or=[{dealerActive:true},{dealerId:allowExistingOfferDealerId}];
+  else offeringFilter.dealerActive=true;
+  const offerings = await DealerRSAService.find(offeringFilter).session(session).lean();
   const offerMap = new Map(offerings.map(o => [id(o.dealerId), o]));
-  const dealers = await Vendor.find({_id:{$in:offerings.map(o=>o.dealerId)},rsaEnabled:true,online:true,'status.isActive':true,'status.adminApproved':true,rsaAvailableCapacity:{$gt:0},rsaCapacityLimit:{$gt:0},$expr:{$lt:[{$ifNull:['$rsaCapacityReserved',0]},'$rsaCapacityLimit']},latitude:{$type:'number'},longitude:{$type:'number'},...(service.requiresTowingCapability?{rsaCapabilities:'towing'}:{})}).session(session).select('shopName latitude longitude serviceRadiusKm averageRating ratingCount status isBlocked rsaEnabled rsaAvailableCapacity rsaCapacityLimit rsaCapacityReserved').lean();
+  const dealers = await Vendor.find({_id:{$in:offerings.map(o=>o.dealerId)},rsaEnabled:true,rsaOnline:true,online:true,'status.isActive':true,'status.adminApproved':true,rsaAvailableCapacity:{$gt:0},rsaCapacityLimit:{$gt:0},$expr:{$lt:[{$ifNull:['$rsaCapacityReserved',0]},'$rsaCapacityLimit']},latitude:{$type:'number'},longitude:{$type:'number'},...(service.requiresTowingCapability?{rsaCapabilities:'towing'}:{})}).session(session).select('shopName latitude longitude serviceRadiusKm averageRating ratingCount status isBlocked rsaEnabled rsaOnline rsaAvailableCapacity rsaCapacityLimit rsaCapacityReserved').lean();
   const providers = dealers.map(dealer => ({dealer,offering:offerMap.get(id(dealer)),distanceKm:distanceKm(location.latitude,location.longitude,dealer.latitude,dealer.longitude)}))
     .filter(p => p.distanceKm <= Number(p.dealer.serviceRadiusKm || 0) && p.dealer.isBlocked !== true)
     .sort((a,b)=>a.distanceKm-b.distanceKm);
+  if (lockAssignments && providers.length) {
+    const offeringIds = providers.map(provider => provider.offering._id);
+    const locked = await DealerRSAService.updateMany(
+      {_id:{$in:offeringIds},revokedAt:null,priceStatus:'approved'},
+      {$inc:{eligibilityVersion:1}},
+      {session},
+    );
+    if (locked.modifiedCount !== offeringIds.length) throw Object.assign(new Error('RSA service eligibility changed; retry the request'), {httpStatus:409});
+  }
   return {service,area,providers};
 }
 
@@ -48,7 +60,7 @@ async function stageBatch(requestId, io, session) {
   let cursor = request.dispatchCursor;
   let dealers = request.candidateDealerIds.slice(cursor, cursor + BATCH_SIZE);
   if (request.dispatchMode === 'manual') dealers = request.candidateDealerIds.slice(0,1);
-  const check = await eligibleAt(request.serviceId, request.bikeId, request.location, session);
+  const check = await eligibleAt(request.serviceId, request.bikeId, request.location, session, true);
   const current = new Map(check.providers.map(p=>[id(p.dealer._id),p]));
   dealers = dealers.filter(dealerId=>current.has(id(dealerId)) && !request.offers.some(o=>id(o.dealerId)===id(dealerId)&&['rejected','expired'].includes(o.state)));
   while (!dealers.length && request.dispatchMode === 'auto' && cursor < request.candidateDealerIds.length) {

@@ -259,13 +259,13 @@ async function run() {
   // Real booking data enters Most Booked; the selected service remains unique.
   const service3AdminRow = await AdminService.findOne({ base_service_id: SVC[3] }).select("_id").lean();
   await Booking.collection.insertOne({
-    _id: id(901), dealer_id: D2, services: [service3AdminRow._id],
+    _id: id(901), bookingId: "RSA-AUDIT-TEST-901", dealer_id: D2, services: [service3AdminRow._id],
     userBike_id: BIKE_B, status: "completed", create_date: new Date(),
   });
   const service4AdminRow = await AdminService.findOne({ base_service_id: SVC[4] }).select("_id").lean();
   await Booking.collection.insertMany([
-    { _id: id(902), dealer_id: D2, services: [service4AdminRow._id], userBike_id: BIKE_C, status: "completed", create_date: new Date() },
-    { _id: id(903), dealer_id: D2, services: [service4AdminRow._id], userBike_id: BIKE_C, status: "completed", create_date: new Date() },
+    { _id: id(902), bookingId: "RSA-AUDIT-TEST-902", dealer_id: D2, services: [service4AdminRow._id], userBike_id: BIKE_C, status: "completed", create_date: new Date() },
+    { _id: id(903), bookingId: "RSA-AUDIT-TEST-903", dealer_id: D2, services: [service4AdminRow._id], userBike_id: BIKE_C, status: "completed", create_date: new Date() },
   ]);
   const withRealPopularity = await call(homeController.homeFeed, req(here, { user_id: String(USER) }));
   assert.deepStrictEqual(withRealPopularity.data.sections.find(item => item.key === "mostBooked").items.map(item => item.name), ["Service 4", "Service 3"], "Most Booked follows real popularity even when the more popular service is for another saved bike");

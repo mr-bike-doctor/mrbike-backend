@@ -11,12 +11,12 @@ const offerSchema = new mongoose.Schema({
 }, {_id: false});
 
 const rsaRequestSchema = new mongoose.Schema({
+  // Legacy database photo fields are intentionally not mapped or migrated.
   customerId: {type: mongoose.Schema.Types.ObjectId, ref: 'customers', required: true, index: true},
   serviceId: {type: mongoose.Schema.Types.ObjectId, ref: 'RSAService', required: true},
   bikeId: {type: mongoose.Schema.Types.ObjectId, ref: 'UserBike', required: true},
   location: {latitude: {type: Number, required: true}, longitude: {type: Number, required: true}, label: {type: String, default: ''}},
   description: {type: String, default: '', maxlength: 1000},
-  photoUrl: {type: String, default: ''},
   providerLocation: {latitude:Number,longitude:Number,accuracy:Number,heading:Number,capturedAt:Date,receivedAt:Date},
   dispatchMode: {type: String, enum: ['auto', 'manual'], required: true},
   status: {type: String, enum: ['searching','assigned','on_the_way','arrived','inspection','repair','towing','payment_pending','completed','cancelled','failed'], default: 'searching', index: true},
@@ -31,9 +31,19 @@ const rsaRequestSchema = new mongoose.Schema({
   estimateAmount: {type: Number, min: 0, default: null},
   estimateLines: {type: [{description:{type:String,required:true,maxlength:160},amount:{type:Number,min:0,required:true}}], default: []},
   estimateVersion: {type:Number,default:0},
+  towingProposal: {
+    status: {type:String,enum:['none','pending_customer','approved','declined'],default:'none'},
+    dealerId: {type:mongoose.Schema.Types.ObjectId,ref:'Vendor',default:null},
+    reason: {type:String,default:'',maxlength:1000},
+    inspectionNotes: {type:String,default:'',maxlength:2000},
+    bikeCondition: {type:String,default:'',maxlength:500},
+    distanceKm: {type:Number,min:0,default:null},
+    pickupLocation: {latitude:Number,longitude:Number,label:String},
+    proposedAt: {type:Date,default:null},
+  },
   estimateStatus: {type: String, enum: ['none','pending_customer','approved','declined'], default: 'none'},
   dealerWorkStatus: {type: String, default: ''},
-  serviceMode: {type:String,enum:['repair','towing'],default:null},
+  serviceMode: {type:String,enum:['repair','towing',null],default:null},
   repairStartedAt: {type:Date,default:null},
   paymentStatus: {type:String,enum:['not_required','pending','cash_confirmed'],default:'pending'},
   paymentAmount: {type:Number,min:0,default:null},
@@ -44,7 +54,6 @@ const rsaRequestSchema = new mongoose.Schema({
   towingStages: {type:[{stage:String,at:{type:Date,default:Date.now},latitude:Number,longitude:Number}],default:[]},
   handoverCodeHash: {type:String,default:''},
   handoverVerifiedAt: {type:Date,default:null},
-  photos: {type:[{url:String,key:String,uploadedAt:{type:Date,default:Date.now}}],default:[]},
   version: {type: Number, default: 0},
   completedAt: {type: Date, default: null},
   cancelledAt: {type: Date, default: null},
