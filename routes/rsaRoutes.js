@@ -45,6 +45,7 @@ router.patch('/admin/proposals/:id/review', requireAdmin, wrap(controller.review
 router.get('/admin/services/:serviceId/dealers', requireAdmin, wrap(controller.adminServiceDealers));
 router.get('/admin/dealer-directory', requireAdmin, wrap(controller.adminDealerDirectory));
 router.post('/admin/services/:serviceId/dealers', requireAdmin, wrap(controller.adminAssignService));
+router.patch('/admin/dealer-services/:id/price', requireAdmin, wrap(controller.adminSetDealerServicePrice));
 router.patch('/admin/dealer-services/:id/status', requireAdmin, wrap(controller.adminToggleDealerService));
 router.delete('/admin/dealer-services/:id', requireAdmin, wrap(controller.adminRevokeDealerService));
 

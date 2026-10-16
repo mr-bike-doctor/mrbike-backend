@@ -227,8 +227,10 @@ exports.adminDealerDirectory = async (req,res) => {
 };
 
 exports.adminAssignService = async (req,res) => {
-  const {dealerId}=req.body||{};
+  const {dealerId,price}=req.body||{};
   if(!idValid(req.params.serviceId)||!idValid(dealerId)) return fail(res,400,'Valid service and dealer ids are required');
+  if(price!==undefined&&!moneyValid(price)) return fail(res,400,'Valid service price is required');
+  const directApproval=price!==undefined;
   let row,created=false;
   try {
     row=await withTransaction(async session=>{
@@ -239,18 +241,31 @@ exports.adminAssignService = async (req,res) => {
       ]);
       if(!service) throw Object.assign(new Error('RSA service not found'),{httpStatus:404});
       if(!dealer||dealer.isBlocked) throw Object.assign(new Error('Dealer not found or blocked'),{httpStatus:404});
+      if(directApproval){
+        if(!service.isActive) throw Object.assign(new Error('Activate the global RSA service before assigning it directly'),{httpStatus:409});
+        if(!dealer.rsaEnabled||dealer.status?.adminApproved!==true||dealer.status?.isActive!==true) throw Object.assign(new Error('Dealer must be Admin-approved, active and enabled for RSA'),{httpStatus:409});
+        if((service.requiresTowingCapability||service.type==='towing')&&(!dealer.rsaCapabilities?.includes('towing')||dealer.status?.isVerified!==true)) throw Object.assign(new Error('Verified towing capability is required'),{httpStatus:409});
+      }
+      const directFields=directApproval?{proposedPrice:Number(price),approvedPrice:Number(price),priceStatus:'approved',dealerActive:true,revisionPrice:null,reviewReason:'',reviewedBy:req.admin_id,reviewedAt:new Date(),adminDisabledAt:null}:null;
       const existing=await DealerRSAService.findOne({dealerId:dealer._id,serviceId:service._id}).session(session);
-      if(existing&&!existing.revokedAt) return existing;
+      if(existing&&!existing.revokedAt){
+        if(!directApproval) return existing;
+        const before=existing.toObject();
+        const updated=await DealerRSAService.findOneAndUpdate({_id:existing._id,revokedAt:null,priceVersion:existing.priceVersion},{$set:directFields,$inc:{priceVersion:1,eligibilityVersion:1}},{new:true,runValidators:true,session});
+        if(!updated) throw Object.assign(new Error('Assignment changed concurrently; reload and retry'),{httpStatus:409});
+        await audit('dealer_service',updated._id,req.admin_id,'admin','direct_price_approved',before,updated.toObject(),'',session);
+        return updated;
+      }
       if(existing){
         const before=existing.toObject();
-        const restored=await DealerRSAService.findOneAndUpdate({_id:existing._id,revokedAt:existing.revokedAt},{$set:{revokedAt:null,revokedBy:null,adminDisabledAt:null,proposedPrice:null,approvedPrice:null,priceStatus:'pending',dealerActive:false,revisionPrice:null,reviewReason:''},$inc:{priceVersion:1}},{new:true,runValidators:true,session});
+        const restored=await DealerRSAService.findOneAndUpdate({_id:existing._id,revokedAt:existing.revokedAt},{$set:{revokedAt:null,revokedBy:null,adminDisabledAt:null,proposedPrice:null,approvedPrice:null,priceStatus:'pending',dealerActive:false,revisionPrice:null,reviewReason:'',...(directFields||{})},$inc:{priceVersion:1,eligibilityVersion:1}},{new:true,runValidators:true,session});
         if(!restored) throw Object.assign(new Error('Assignment changed concurrently; reload and retry'),{httpStatus:409});
-        await audit('dealer_service',restored._id,req.admin_id,'admin','restored',before,restored.toObject(),'',session);
+        await audit('dealer_service',restored._id,req.admin_id,'admin',directApproval?'restored_and_directly_approved':'restored',before,restored.toObject(),'',session);
         return restored;
       }
       created=true;
-      const [assigned]=await DealerRSAService.create([{dealerId:dealer._id,serviceId:service._id,proposedPrice:null,approvedPrice:null,priceStatus:'pending',dealerActive:false}],{session});
-      await audit('dealer_service',assigned._id,req.admin_id,'admin','assigned',null,assigned.toObject(),'',session);
+      const [assigned]=await DealerRSAService.create([{dealerId:dealer._id,serviceId:service._id,proposedPrice:null,approvedPrice:null,priceStatus:'pending',dealerActive:false,...(directFields||{})}],{session});
+      await audit('dealer_service',assigned._id,req.admin_id,'admin',directApproval?'assigned_and_directly_approved':'assigned',null,assigned.toObject(),'',session);
       return assigned;
     });
     return ok(res,row,created?201:200);
@@ -258,6 +273,28 @@ exports.adminAssignService = async (req,res) => {
     if(e.code===11000){const duplicate=await DealerRSAService.findOne({dealerId,serviceId:req.params.serviceId}).lean();if(duplicate&&!duplicate.revokedAt)return ok(res,duplicate,200);}
     return fail(res,e.httpStatus||500,e.httpStatus?e.message:'Could not assign RSA service');
   }
+};
+
+exports.adminSetDealerServicePrice = async (req,res) => {
+  if(!idValid(req.params.id)) return fail(res,400,'Invalid dealer service id');
+  const {price}=req.body||{};
+  if(!moneyValid(price)) return fail(res,400,'Valid service price is required');
+  try {
+    const saved=await withTransaction(async session=>{
+      const row=await DealerRSAService.findOne({_id:req.params.id,revokedAt:null}).session(session).populate('serviceId').populate('dealerId');
+      if(!row) throw Object.assign(new Error('Active service assignment not found'),{httpStatus:404});
+      const service=row.serviceId,dealer=row.dealerId;
+      if(!service?.isActive) throw Object.assign(new Error('Activate the global RSA service before assigning it directly'),{httpStatus:409});
+      if(!dealer?.rsaEnabled||dealer.status?.adminApproved!==true||dealer.status?.isActive!==true||dealer.isBlocked) throw Object.assign(new Error('Dealer must be Admin-approved, active and enabled for RSA'),{httpStatus:409});
+      if((service.requiresTowingCapability||service.type==='towing')&&(!dealer.rsaCapabilities?.includes('towing')||dealer.status?.isVerified!==true)) throw Object.assign(new Error('Verified towing capability is required'),{httpStatus:409});
+      const before=row.toObject(),now=new Date();
+      const updated=await DealerRSAService.findOneAndUpdate({_id:row._id,revokedAt:null,priceVersion:row.priceVersion},{$set:{proposedPrice:Number(price),approvedPrice:Number(price),priceStatus:'approved',dealerActive:true,revisionPrice:null,reviewReason:'',reviewedBy:req.admin_id,reviewedAt:now,adminDisabledAt:null},$inc:{priceVersion:1,eligibilityVersion:1}},{new:true,runValidators:true,session});
+      if(!updated) throw Object.assign(new Error('Assignment changed concurrently; reload and retry'),{httpStatus:409});
+      await audit('dealer_service',updated._id,req.admin_id,'admin','price_set_and_directly_approved',before,updated.toObject(),'',session);
+      return updated;
+    });
+    return ok(res,saved);
+  } catch(e) { return fail(res,e.httpStatus||500,e.httpStatus?e.message:'Could not directly approve RSA service'); }
 };
 
 exports.adminToggleDealerService = async (req,res) => {
