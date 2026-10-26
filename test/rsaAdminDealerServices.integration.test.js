@@ -34,7 +34,7 @@ async function run() {
   await Promise.all([RSAService.init(), DealerRSAService.init(), RSAAudit.init(), RSARequest.init(), RSAArea.init(), Vendor.init(), UserBike.init()]);
 
   const adminRoutes = router.stack.filter(layer => layer.route && /\/admin\/(services\/.*\/dealers|dealer-directory|dealer-services)/.test(layer.route.path));
-  assert.strictEqual(adminRoutes.length, 5, 'service assignment and management endpoints are registered');
+  assert.strictEqual(adminRoutes.length, 6, 'service assignment and management endpoints are registered');
   for (const layer of adminRoutes) assert(layer.route.stack.some(item => item.handle === requireAdmin), `${layer.route.path} requires Admin auth`);
   const denied = await call(requireAdmin, { headers: {} });
   assert.strictEqual(denied.statusCode, 401, 'Admin service APIs reject missing credentials');
