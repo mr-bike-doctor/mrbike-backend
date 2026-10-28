@@ -42,8 +42,37 @@ function serializeService(service, req) {
 }
 
 function feedSection(key, title, itemType, items, limit) {
-  const boundedItems = items.slice(0, limit)
+  const boundedItems = limit == null ? items : items.slice(0, limit)
   return { key, title, itemType, visible: boundedItems.length > 0, items: boundedItems }
+}
+
+// Home's garage row and its "See All" list. Every eligible nearby garage is
+// returned, so a newly onboarded garage with no ratings is
+// never hidden behind established ones. The row on Home shows the head of this
+// list: top-rated first, then a few new garages, then everyone else.
+const HOME_GARAGE_LIMIT = 500
+const HOME_TOP_RATED_SLOTS = 5
+const HOME_NEW_GARAGE_SLOTS = 3
+
+const byDistance = (a, b) =>
+  (a.distanceKm ?? Number.MAX_SAFE_INTEGER) - (b.distanceKm ?? Number.MAX_SAFE_INTEGER)
+
+function rankHomeGarages(garages) {
+  const tagged = garages.map(garage => ({ ...garage, isNew: !garage.ratingCount }))
+  const rated = tagged
+    .filter(garage => !garage.isNew)
+    .sort((a, b) => b.averageRating - a.averageRating || byDistance(a, b) ||
+      a.shopName.localeCompare(b.shopName) || String(a.dealerId).localeCompare(String(b.dealerId)))
+  const fresh = tagged
+    .filter(garage => garage.isNew)
+    .sort((a, b) => byDistance(a, b) ||
+      a.shopName.localeCompare(b.shopName) || String(a.dealerId).localeCompare(String(b.dealerId)))
+  return [
+    ...rated.slice(0, HOME_TOP_RATED_SLOTS),
+    ...fresh.slice(0, HOME_NEW_GARAGE_SLOTS),
+    ...rated.slice(HOME_TOP_RATED_SLOTS),
+    ...fresh.slice(HOME_NEW_GARAGE_SLOTS),
+  ]
 }
 
 function sortByPopularityThenDistance(a, b) {
@@ -202,10 +231,8 @@ async function homeFeed(req, res) {
         ratingCount: rating.ratingCount,
         shopImages: (dealer.shopImages || []).map(url => formatImage(url, req)),
       }
-    }).sort((a, b) => b.averageRating - a.averageRating ||
-      (a.distanceKm ?? Number.MAX_SAFE_INTEGER) - (b.distanceKm ?? Number.MAX_SAFE_INTEGER) ||
-      a.shopName.localeCompare(b.shopName) || String(a.dealerId).localeCompare(String(b.dealerId)))
-      .slice(0, 5)
+    })
+    const rankedGarages = rankHomeGarages(garages)
 
     const sections = [
       feedSection("categories", "Browse by Category", "categories", visibleCategories, 12),
@@ -214,7 +241,7 @@ async function homeFeed(req, res) {
       feedSection("mostBooked", "Most Booked", "services", mostBooked, 6),
       feedSection("recommended", "Recommended For Your Bike", "services", recommended, 10),
       feedSection("explore", "Explore Services", "services", explore, 12),
-      feedSection("topGarages", "Top Rated Garages", "garages", garages, 5),
+      feedSection("topGarages", "Top Rated & New Garages", "garages", rankedGarages),
     ]
     return res.status(200).json({
       status: true,
@@ -542,7 +569,13 @@ async function topGarages(req, res) {
 
     const ratingsMap = await getRatingsMap(dealers.map(d => d._id))
 
-    const ranked = dealers
+    // Optional page size; defaults to the Home row (top-rated + new garages).
+    const requestedLimit = Number.parseInt(req.query.limit, 10)
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, HOME_GARAGE_LIMIT)
+      : HOME_TOP_RATED_SLOTS + HOME_NEW_GARAGE_SLOTS
+
+    const ranked = rankHomeGarages(dealers
       .map(dealer => {
         const rating = ratingsMap.get(String(dealer._id)) || { averageRating: 0, ratingCount: 0 }
         const distanceKm = scope.distanceByDealerId.get(String(dealer._id))
@@ -558,13 +591,8 @@ async function topGarages(req, res) {
           ratingCount: rating.ratingCount,
           shopImages: (dealer.shopImages || []).map(url => formatImage(url, req)),
         }
-      })
-      .sort((a, b) => {
-        if (b.averageRating !== a.averageRating) return b.averageRating - a.averageRating
-        if (a.distanceKm != null && b.distanceKm != null) return a.distanceKm - b.distanceKm
-        return 0
-      })
-      .slice(0, 5)
+      }))
+      .slice(0, limit)
 
     return res.status(200).json({
       status: true,
@@ -578,4 +606,4 @@ async function topGarages(req, res) {
   }
 }
 
-module.exports = { homeFeed, quickServices, recommended, mostBooked, topGarages }
+module.exports = { homeFeed, quickServices, recommended, mostBooked, topGarages, rankHomeGarages }

@@ -195,6 +195,8 @@ async function garagesForService(req, res) {
         return {
           dealerId: e.dealer._id,
           shopName: e.dealer.shopName,
+          fullAddress: e.dealer.fullAddress || e.dealer.address || null,
+          address: e.dealer.address || null,
           city: e.dealer.city,
           locality: e.dealer.locality,
           latitude: e.dealer.latitude,

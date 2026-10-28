@@ -54,7 +54,7 @@ const ELIGIBILITY_DEALER_FIELDS =
 
 // Dealer fields a garage card renders, on top of the eligibility fields above.
 const GARAGE_DEALER_FIELDS =
-  `${ELIGIBILITY_DEALER_FIELDS} shopName city locality shopImages providesPickup providesDrop towingCharges pickupCharges`
+  `${ELIGIBILITY_DEALER_FIELDS} shopName fullAddress address city locality shopImages providesPickup providesDrop towingCharges pickupCharges`
 
 // A dealer must also be solvent to take work — same floor the nearby-dealer
 // lookup in geoAndRatings.js applies.
