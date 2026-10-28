@@ -103,7 +103,7 @@ async function homeFeed(req, res) {
             feedSection("featured", "Featured Services", "services", [], 8),
             feedSection("quickServices", "Quick Services", "services", [], 8),
             feedSection("mostBooked", "Most Booked", "services", [], 6),
-            feedSection("recommended", "Recommended For Your Bike", "services", [], 10),
+            feedSection("recommended", "Recommended For Your Bike", "services", []),
             feedSection("explore", "Explore Services", "services", [], 12),
             feedSection("topGarages", "Top Rated Garages", "garages", [], 5),
           ],
@@ -178,7 +178,6 @@ async function homeFeed(req, res) {
     const distanceValues = rankedServices.map(item => item.nearestDealerDistanceKm).filter(value => value != null)
     const proximityScale = Math.max(DEFAULT_RADIUS_KM, ...distanceValues)
     const recommendedCandidates = rankedServices
-      .filter(item => !used.has(String(item.serviceId)))
       .map(item => {
         const popularityScore = item.popularityCount / maxCount
         const distance = item.nearestDealerDistanceKm
@@ -198,7 +197,7 @@ async function homeFeed(req, res) {
         return { ...item, score: Number(score.toFixed(3)), reasonCode, reasonLabel }
       })
       .sort((a, b) => Number(b.isPrimaryBikeCompatible) - Number(a.isPrimaryBikeCompatible) || b.score - a.score || sortByPopularityThenDistance(a, b))
-    const recommended = take(recommendedCandidates, 10)
+    const recommended = recommendedCandidates.map(({ _isFeatured, _isQuickService, ...publicItem }) => publicItem)
     const explore = take(rankedServices.slice().sort(comparePrimaryFirst), 12)
 
     const representedCategories = new Set(rankedServices
@@ -239,7 +238,7 @@ async function homeFeed(req, res) {
       feedSection("featured", "Featured Services", "services", featured, 8),
       feedSection("quickServices", "Quick Services", "services", quick, 8),
       feedSection("mostBooked", "Most Booked", "services", mostBooked, 6),
-      feedSection("recommended", "Recommended For Your Bike", "services", recommended, 10),
+      feedSection("recommended", "Recommended For Your Bike", "services", recommended),
       feedSection("explore", "Explore Services", "services", explore, 12),
       feedSection("topGarages", "Top Rated & New Garages", "garages", rankedGarages),
     ]
@@ -454,7 +453,6 @@ async function recommended(req, res) {
         }
       })
       .sort((a, b) => b.score - a.score)
-      .slice(0, 10)
 
     return res.status(200).json({
       status: true,
