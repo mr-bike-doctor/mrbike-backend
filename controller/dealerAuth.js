@@ -251,6 +251,8 @@ async function verifyOTP(req, res) {
         isDoc: false,
         isActive: true,
         wallet: 0,
+        appLoggedIn: true,
+        lastLoginAt: new Date(),
         ...(isTestAccountLogin ? { isPlayStoreTestAccount: true } : {}),
       });
 
@@ -278,6 +280,12 @@ async function verifyOTP(req, res) {
       dealer.isPlayStoreTestAccount = true;
       await dealer.save({ validateModifiedOnly: true });
     }
+
+    // Admin-visible session state only; never touches availability (`online`).
+    await Vendor.updateOne(
+      { _id: dealer._id },
+      { $set: { appLoggedIn: true, lastLoginAt: new Date() } }
+    );
 
     const token = validation.generateUserToken(dealer._id, "dealer", "2h");
     // The onboarding wizard only ever runs once. `submittedAt` is set exactly
@@ -421,6 +429,8 @@ async function logout(req, res) {
         lastSeen: new Date(),
         device_token: null,
         ftoken: null,
+        appLoggedIn: false,
+        lastLogoutAt: new Date(),
       },
     });
     console.log(

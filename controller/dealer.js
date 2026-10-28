@@ -1256,6 +1256,9 @@ const ADMIN_DEALER_LIST_FIELDS = [
   "isActive", "isBlocked", "status", "submittedAt", "approvedAt",
   "reVerification", "formProgress", "documentVerification", "minWalletAmount",
   "commission", "tax", "serviceRadiusKm", "services", "createdAt", "updatedAt", "online",
+  "activeSince", "lastSeen", "appLoggedIn", "lastLoginAt", "lastLogoutAt",
+  // Read only to derive appLoggedIn for older dealers; stripped before responding.
+  "device_token", "ftoken",
 ].join(" ");
 
 const ADMIN_DEALER_SORT_FIELDS = ["createdAt", "updatedAt", "submittedAt", "approvedAt", "shopName", "ownerName", "city"];
@@ -1340,11 +1343,16 @@ async function adminDealerList(req, res) {
       : [];
     const statsById = new Map(bookingStats.map((s) => [String(s._id), s]));
 
-    const data = dealers.map((dealer) => {
+    const data = dealers.map(({ device_token, ftoken, ...dealer }) => {
       const stats = statsById.get(String(dealer._id));
       const stageId = getDealerStage(dealer);
       return {
         ...dealer,
+        // Dealers who last logged in before appLoggedIn existed: a registered
+        // device means an app session is still live (logout clears it).
+        appLoggedIn: typeof dealer.appLoggedIn === "boolean"
+          ? dealer.appLoggedIn
+          : Boolean(device_token || ftoken),
         dealerId: dealer.id ? `MRBD${String(dealer.id).padStart(4, "0")}` : null,
         stage: stageId,
         stageLabel: STAGE_LABELS[stageId],
@@ -1649,7 +1657,9 @@ async function registerDealerToken(req, res) {
 
     const dealer = await Vendor.findByIdAndUpdate(
       dealer_id,
-      { device_token: device_token.trim() },
+      // The app registers its token right after login, so this also marks
+      // the provider-app session as logged in for the admin panel.
+      { device_token: device_token.trim(), appLoggedIn: true },
       { new: true, select: "_id shopName device_token" }
     );
 
